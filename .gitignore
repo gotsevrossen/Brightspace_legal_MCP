@@ -1,0 +1,17 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# Never commit local secrets or anything pulled from Brightspace.
+.env
+.env.*
+*.json.local
+brightspace_data*.json
+*.png
+!docs/**/*.png
+audit.jsonl
