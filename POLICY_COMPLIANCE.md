@@ -81,7 +81,30 @@ falls short of it.
 5. **Policies change.** The AI tools list was revised several times in 2025 and 2026. Check it
    again each semester.
 
-## 5. Sources
+## 5. Study Deck (the board-game web app)
+
+Study Deck reads **course content**, not student records, and sends it only to **Purdue GenAI
+Studio**. GenAI Studio is authorized for Sensitive data but excludes FERPA data; course materials
+are Sensitive and not FERPA records, so they fit. It never reads grades, submissions, classlists
+or discussions. The only student-record data it touches is each player's own enrollment list,
+used inside the server to check enrollment and never sent to the AI.
+
+| Control | Policies |
+|---|---|
+| AI endpoint locked to `https://*.purdue.edu` (GenAI Studio); only course text in prompts, no names | P2, P3, P7 |
+| A course's Brightspace material is used only if every player has verified enrollment in it through their own sign-in; late joiners must verify | P4, P7, P8 |
+| Host confirms each course's syllabus allows AI study tools | P9 |
+| Quiz, exam, answer-key and solution files skipped; uploaders confirm no assessments or others' personal information | P9, P7 |
+| OAuth 2.0 + PKCE sign-in on Purdue's page, tokens in memory only | P5, P6 |
+| Everything held in memory; deleted when the game ends or goes idle; metadata-only audit log | P4 |
+| Same rate limiter and route allowlist as the MCP server, plus course-file reading (`content:file:read`) for this client only | P1, P10 |
+
+A hosted Study Deck that several students use is a new Purdue integration handling Sensitive
+data. It needs the Brightspace integration review, a Systems Security review, and RCAC
+confirmation for the GenAI Studio API before real students use it. See
+[STUDY_DECK.md](STUDY_DECK.md).
+
+## 6. Sources
 
 - Acceptable Use of IT Resources and Information Assets (VII.A.4): <https://www.purdue.edu/vpec/policies/information-technology/viia4/>
 - Acceptable Use procedures: <https://www.purdue.edu/securepurdue/it-policies-standards/it-procedures/acceptable-use-of-resources-procedures.php>

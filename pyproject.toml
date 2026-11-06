@@ -17,13 +17,23 @@ dependencies = [
 
 [project.optional-dependencies]
 browser = ["playwright>=1.45,<2"]
-dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+web = [
+    "starlette>=0.40",
+    "uvicorn>=0.30",
+    "itsdangerous>=2.1",
+    "python-multipart>=0.0.9",
+    "pypdf>=4",
+    "python-docx>=1.1",
+    "python-pptx>=0.6.23",
+]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "purdue-brightspace-mcp[web]"]
 
 [project.scripts]
 purdue-brightspace-mcp = "purdue_brightspace_mcp.server:main"
+study-deck = "study_deck.app:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/purdue_brightspace_mcp"]
+packages = ["src/purdue_brightspace_mcp", "src/study_deck"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

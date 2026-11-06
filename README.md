@@ -12,6 +12,11 @@ original did that conflicts with them, and how this version handles each one.
 
 > Unofficial. Not affiliated with or approved by Purdue University or D2L, and not legal advice.
 
+This repository also contains **[Study Deck](STUDY_DECK.md)**, a multiplayer web app for a study
+board game. It builds question decks from Brightspace course content and players' notes through
+Purdue GenAI Studio, using the same policy controls. Run it with `pip install -e ".[web]"` and
+then `study-deck`.
+
 ## What is different from the original
 
 | | Original | This server |

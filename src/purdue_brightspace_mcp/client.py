@@ -57,6 +57,15 @@ FORBIDDEN_ROUTE_REASONS: tuple[tuple[re.Pattern[str], str], ...] = tuple(
 )
 
 
+# Course content files (slides, PDFs, notes). Only clients created with
+# allow_course_files=True (the Study Deck web app, for courses the user has
+# confirmed allow AI study use) may fetch these. The MCP server never does.
+COURSE_FILE_ROUTE = re.compile(rf"^/d2l/api/le/{_V}/{_ID}/content/topics/{_ID}/file$")
+
+# Largest course file the Study Deck will download (bytes).
+MAX_COURSE_FILE_BYTES = 15 * 1024 * 1024
+
+
 class AuthRequired(Exception):
     """No valid Brightspace session; the user needs to sign in."""
 
@@ -70,10 +79,14 @@ class BrightspaceHTTPError(Exception):
 class Transport(Protocol):
     async def get_json(self, url: str) -> Any: ...
 
+    async def get_bytes(self, url: str, max_bytes: int) -> tuple[bytes, str]: ...
+
     async def close(self) -> None: ...
 
 
-def check_route(path: str) -> None:
+def check_route(path: str, allow_course_files: bool = False) -> None:
+    if allow_course_files and COURSE_FILE_ROUTE.match(path):
+        return
     for pattern, reason in FORBIDDEN_ROUTE_REASONS:
         if pattern.search(path):
             raise PolicyViolation(f"Blocked request: {reason}")
@@ -108,7 +121,9 @@ class RateLimiter:
 
 
 class BrightspaceClient:
-    def __init__(self, settings: Settings, transport: Transport, audit: AuditLog) -> None:
+    def __init__(
+        self, settings: Settings, transport: Transport, audit: AuditLog, allow_course_files: bool = False
+    ) -> None:
         parts = urlsplit(settings.base_url)
         if parts.scheme != "https" or parts.hostname not in ALLOWED_HOSTS:
             raise ValueError(f"Base URL must be https on one of {sorted(ALLOWED_HOSTS)}")
@@ -116,12 +131,21 @@ class BrightspaceClient:
         self.settings = settings
         self.transport = transport
         self.audit = audit
+        self.allow_course_files = allow_course_files
         self.limiter = RateLimiter(settings.min_seconds_between_requests, settings.max_requests_per_hour)
         self._cache: dict[str, tuple[float, Any]] = {}
         self._versions: dict[str, str] | None = None
 
+    async def get_course_file(self, path: str) -> tuple[bytes, str]:
+        """Download one course content file (bytes, content type). Never cached."""
+        if not self.allow_course_files or not COURSE_FILE_ROUTE.match(path):
+            raise PolicyViolation("Blocked request: course files are not available to this client.")
+        await self.limiter.acquire()
+        self.audit.write("api_get_file", path=path)
+        return await self.transport.get_bytes(f"{self.base_url}{path}", MAX_COURSE_FILE_BYTES)
+
     async def get(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        check_route(path)
+        check_route(path, self.allow_course_files)
         query = urlencode({k: v for k, v in (params or {}).items() if v is not None})
         url = f"{self.base_url}{path}" + (f"?{query}" if query else "")
         cached = self._cache.get(url)
