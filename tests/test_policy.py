@@ -216,3 +216,21 @@ def test_browser_mode_requires_acknowledgement(tmp_path):
     assert not BrowserSessionTransport(
         Settings(auth_mode="browser", browser_mode_acknowledged=True, state_dir=tmp_path)
     ).is_signed_in()
+
+
+@pytest.mark.parametrize(
+    "url,expected",
+    [
+        ("https://purdue.brightspace.com/d2l/home", True),
+        ("https://purdue.brightspace.com/d2l/home/12345", True),
+        ("https://purdue.brightspace.com/d2l/le/content/1/Home", True),
+        ("https://purdue.brightspace.com/d2l/login", False),
+        ("https://purdue.brightspace.com/d2l/lp/auth/saml/login", False),
+        ("https://login.microsoftonline.com/common/oauth2/authorize?x=/d2l/home", False),
+        ("https://purdue.brightspace.com.evil.example/d2l/home", False),
+    ],
+)
+def test_browser_sign_in_detection_is_mfa_agnostic(url, expected):
+    from purdue_brightspace_mcp.auth.browser import is_signed_in_url
+
+    assert is_signed_in_url(url) is expected

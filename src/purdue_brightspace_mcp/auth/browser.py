@@ -5,7 +5,8 @@ original scraper this project replaces, this mode:
 
 * never reads, stores or types the user's Purdue password. A normal browser
   window opens on Purdue's own sign-in page, and the user signs in and
-  approves Duo themselves (S-13, S-16).
+  completes two-factor approval themselves, whatever method Purdue uses
+  (Microsoft Authenticator, Duo, ...) (S-13, S-16).
 * keeps the session in memory only: the browser context is not persistent,
   so no cookies or tokens are written to disk. Closing the server ends it.
 * does not scrape pages or take screenshots. After sign-in it calls the same
@@ -28,6 +29,22 @@ from ..client import AuthRequired, BrightspaceHTTPError
 from ..config import ALLOWED_HOSTS, Settings
 
 log = logging.getLogger(__name__)
+
+
+def is_signed_in_url(url: str) -> bool:
+    """True once the browser is back on Purdue Brightspace past the login pages.
+
+    Purdue's sign-in (Microsoft Entra with Microsoft Authenticator, or any other
+    identity provider) redirects through other hosts; we only care that the user
+    ends up inside Brightspace, not which MFA method got them there.
+    """
+    parts = urlsplit(url)
+    if parts.scheme != "https" or parts.hostname not in ALLOWED_HOSTS:
+        return False
+    path = parts.path.lower()
+    if not path.startswith("/d2l/"):
+        return False
+    return not any(path.startswith(p) for p in ("/d2l/login", "/d2l/lp/auth", "/d2l/logout"))
 
 
 class BrowserSessionTransport:
@@ -62,12 +79,12 @@ class BrowserSessionTransport:
         self._context = await self._browser.new_context()
         page = await self._context.new_page()
         await page.goto(f"{self.settings.base_url}/d2l/home")
-        log.info("Sign in to Purdue Brightspace in the browser window that opened.")
+        log.info(
+            "Sign in to Purdue Brightspace in the browser window that opened and approve the "
+            "Microsoft Authenticator prompt on your phone."
+        )
         try:
-            await page.wait_for_url(
-                lambda url: urlsplit(url).hostname in ALLOWED_HOSTS and "/d2l/home" in url,
-                timeout=timeout * 1000,
-            )
+            await page.wait_for_url(is_signed_in_url, timeout=timeout * 1000)
         except Exception as exc:
             await self.sign_out()
             raise AuthRequired("Sign-in was not completed in time.") from exc

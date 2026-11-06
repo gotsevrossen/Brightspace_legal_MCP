@@ -28,7 +28,8 @@ Rules for the assistant:
 - Academic integrity: this server is for organizing coursework (deadlines, announcements, the
   student's own grades). Do not use course materials to complete graded work unless the course
   syllabus allows it. Quiz and exam content is never available.
-- Never ask for the user's Purdue password or Duo codes. Sign-in happens only on Purdue's own page.
+- Never ask for the user's Purdue password or Microsoft Authenticator codes. Sign-in happens only
+  on Purdue's own page.
 - Refer to courses and assignments by name or code (for example "CS 18000"). Internal Brightspace
   IDs are never shown.
 """
@@ -51,8 +52,8 @@ def build_server(settings: Settings | None = None, tools: BrightspaceTools | Non
 
     @server.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=True))
     async def sign_in() -> dict[str, Any]:
-        """Open Purdue's sign-in page in the user's browser so they can sign in and approve Duo
-        themselves. The server never sees the password."""
+        """Open Purdue's sign-in page in the user's browser so they can sign in and approve the
+        Microsoft Authenticator prompt themselves. The server never sees the password."""
         return await t.sign_in()
 
     @server.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=False))

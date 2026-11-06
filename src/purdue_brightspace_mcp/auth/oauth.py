@@ -4,7 +4,7 @@ This is the sanctioned path: Purdue's Brightspace administrators register an
 OAuth 2.0 app (Admin Tools > Manage Extensibility > OAuth 2.0) after Purdue's
 review process for new Brightspace integrations, and issue a client ID. The
 user then consents in their own browser on Purdue's sign-in page. This server
-never sees the user's Purdue password or Duo approval.
+never sees the user's Purdue password or two-factor approval (Microsoft Authenticator).
 
 Refresh tokens are kept in the operating system keyring (encrypted at rest by
 the OS), or in memory only if no keyring is available, in line with S-13.

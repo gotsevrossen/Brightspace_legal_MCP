@@ -42,7 +42,7 @@ falls short of it.
 
 | Control | Where | Policies |
 |---|---|---|
-| **No password handling at all.** There is no username or password setting. Sign-in happens on Purdue's own page, in the user's browser, with Duo approved by the user. | `config.py`, `auth/` | P5, P6 |
+| **No password handling at all.** There is no username or password setting. Sign-in happens on Purdue's own page, in the user's browser, with the two-factor prompt (Microsoft Authenticator) approved by the user on their phone. | `config.py`, `auth/` | P5, P6 |
 | **OAuth 2.0 (authorization code + PKCE) is the default** auth mode. It needs a client ID from a Purdue-approved app registration, with least-privilege **read-only scopes** (`*:read` only, no `enrollment:orgunit:read`). | `auth/oauth.py`, `config.DEFAULT_OAUTH_SCOPES` | P10, P1 |
 | Refresh tokens are kept in the **OS keyring** (encrypted at rest), or in memory only. | `auth/oauth.py` | P5 |
 | **Browser mode is opt-in** (`PURDUE_MCP_BROWSER_MODE_ACKNOWLEDGED=true`). The user signs in manually, and the session is kept **in memory only** (no persistent profile, cookies or screenshots). | `auth/browser.py` | P5, P6, P4 |
