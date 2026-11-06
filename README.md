@@ -71,7 +71,7 @@ password setting.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `PURDUE_MCP_AI_DATA_TIER` | `public` | Highest Purdue data tier **your AI client is authorized for** on Purdue's AI tools list. `public` disables every data tool. `sensitive` enables everything but grades and feedback. `restricted` enables those too. |
+| `PURDUE_MCP_AI_DATA_TIER` | `sensitive` | Highest Purdue data tier **your AI client is authorized for** on Purdue's AI tools list. `sensitive` (default) enables everything but grades and feedback. `restricted` enables those too. `public` disables every data tool. |
 | `PURDUE_MCP_AI_PERMITTED_COURSES` | *(none)* | Comma-separated course IDs whose syllabus you checked and which allow AI with course materials. `*` is rejected. |
 | `PURDUE_MCP_AUTH_MODE` | `oauth` | `oauth` or `browser`. |
 | `PURDUE_MCP_OAUTH_CLIENT_ID` | – | Issued by Purdue's Brightspace admins for an approved OAuth 2.0 app. |
@@ -85,11 +85,13 @@ password setting.
 
 Purdue's AI Use policy (VII.A.5) and its authorized AI tools list say:
 
+- The default, `sensitive`, assumes your AI client is authorized for Sensitive data and that you
+  use it **through Purdue SSO** under Purdue's enterprise or API license. Check the
+  [current list](https://www.purdue.edu/ai/enterprise-ai-toolkit/).
 - An AI tool **not** on the list, including a personal Claude, ChatGPT or Gemini account, may
-  receive **Public data only**. Keep `PURDUE_MCP_AI_DATA_TIER=public`.
-- Sensitive or Restricted data may go only to a tool authorized for that tier, **accessed through
-  Purdue SSO** under Purdue's enterprise or API license. Check the
-  [current list](https://www.purdue.edu/ai/enterprise-ai-toolkit/) before raising the tier.
+  receive **Public data only**. In that case set `PURDUE_MCP_AI_DATA_TIER=public`.
+- Grades, scores and feedback are Restricted and stay off until you set `restricted`, which needs
+  a tool authorized for Restricted data.
 
 ### Example: Claude Desktop
 

@@ -87,9 +87,11 @@ def default_state_dir() -> Path:
 @dataclass(frozen=True)
 class Settings:
     # The highest Purdue data tier the AI client is authorized for, according
-    # to Purdue's current authorized AI tools list. Defaults to Public, which
-    # means every Brightspace data tool refuses until the user changes it.
-    ai_data_tier: DataClass = DataClass.PUBLIC
+    # to Purdue's current authorized AI tools list. Defaults to Sensitive, which
+    # assumes an AI client approved for Sensitive data and used through Purdue
+    # SSO. Grades and feedback (Restricted) still need an explicit opt-in. Set
+    # it to "public" when using a personal AI account.
+    ai_data_tier: DataClass = DataClass.SENSITIVE
     # Courses whose syllabus the user has checked and which permit AI tools to
     # process course materials.
     ai_permitted_courses: frozenset[int] = field(default_factory=frozenset)
@@ -123,7 +125,7 @@ class Settings:
         scopes = tuple(scopes_raw.split()) if scopes_raw else DEFAULT_OAUTH_SCOPES
         state_dir = _env("STATE_DIR")
         return cls(
-            ai_data_tier=DataClass.parse(_env("AI_DATA_TIER", "public") or "public"),
+            ai_data_tier=DataClass.parse(_env("AI_DATA_TIER", "sensitive") or "sensitive"),
             ai_permitted_courses=_parse_course_ids(_env("AI_PERMITTED_COURSES")),
             auth_mode=auth_mode,
             oauth_client_id=_env("OAUTH_CLIENT_ID"),

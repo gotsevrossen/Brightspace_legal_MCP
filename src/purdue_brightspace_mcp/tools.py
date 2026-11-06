@@ -134,11 +134,12 @@ class BrightspaceTools:
                 },
                 "audit_log": str(self.policy.audit.path) if s.audit_log_enabled else "disabled",
                 "policies": POLICY_REFERENCES,
-                "how_to_enable_data_tools": (
-                    f"Set {ENV_PREFIX}AI_DATA_TIER=sensitive (or restricted, for grades) only if the "
-                    "AI client you connect this server to is on Purdue's current authorized AI tools "
-                    "list for that tier and you use it through Purdue SSO. A personal consumer AI "
-                    "account counts as Public-only."
+                "tier_guidance": (
+                    "The default tier is Sensitive. That is appropriate only if the AI client "
+                    "connected to this server is on Purdue's current authorized AI tools list for "
+                    "Sensitive data and you use it through Purdue SSO. A personal consumer AI "
+                    f"account counts as Public-only: set {ENV_PREFIX}AI_DATA_TIER=public in that "
+                    "case. Grades and feedback need AI_DATA_TIER=restricted."
                 ),
             },
         )

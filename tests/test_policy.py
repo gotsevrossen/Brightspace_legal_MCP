@@ -11,15 +11,34 @@ from purdue_brightspace_mcp.policy import PolicyViolation
 from purdue_brightspace_mcp.sanitize import clean_text, html_to_text
 
 
-async def test_default_tier_is_public_and_refuses_everything(tmp_path, transport, monkeypatch):
+def _clean_env(monkeypatch, tmp_path):
     for key in list(__import__("os").environ):
         if key.startswith("PURDUE_MCP_"):
             monkeypatch.delenv(key)
     monkeypatch.setenv("PURDUE_MCP_STATE_DIR", str(tmp_path))
+
+
+async def test_default_tier_is_sensitive_but_grades_stay_restricted(tmp_path, transport, monkeypatch):
+    _clean_env(monkeypatch, tmp_path)
     from purdue_brightspace_mcp.tools import BrightspaceTools
 
     tools = BrightspaceTools(Settings.from_env(), transport_factory=lambda s: transport)
-    assert tools.settings.ai_data_tier is DataClass.PUBLIC
+    assert tools.settings.ai_data_tier is DataClass.SENSITIVE
+    assert Settings().ai_data_tier is DataClass.SENSITIVE
+    assert (await tools.list_courses())["purdue_data_classification"] == "Sensitive"
+    assert (await tools.get_announcements(101))["purdue_data_classification"] == "Sensitive"
+    assert (await tools.get_my_grades(101))["status"] == "refused_by_policy"
+    assert not any("grades" in path for path, _ in transport.calls)
+    status = await tools.assignment_submission_status(101, 9)
+    assert "feedback" not in status["entries"][0]
+
+
+async def test_public_tier_refuses_everything(tmp_path, transport, monkeypatch):
+    _clean_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("PURDUE_MCP_AI_DATA_TIER", "public")
+    from purdue_brightspace_mcp.tools import BrightspaceTools
+
+    tools = BrightspaceTools(Settings.from_env(), transport_factory=lambda s: transport)
     for result in [await tools.list_courses(), await tools.get_my_grades(101), await tools.get_announcements(101)]:
         assert result["status"] == "refused_by_policy"
     assert transport.calls == []  # nothing was fetched

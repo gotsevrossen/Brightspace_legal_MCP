@@ -46,7 +46,7 @@ falls short of it.
 | **OAuth 2.0 (authorization code + PKCE) is the default** auth mode. It needs a client ID from a Purdue-approved app registration, with least-privilege **read-only scopes** (`*:read` only, no `enrollment:orgunit:read`). | `auth/oauth.py`, `config.DEFAULT_OAUTH_SCOPES` | P10, P1 |
 | Refresh tokens are kept in the **OS keyring** (encrypted at rest), or in memory only. | `auth/oauth.py` | P5 |
 | **Browser mode is opt-in** (`PURDUE_MCP_BROWSER_MODE_ACKNOWLEDGED=true`). The user signs in manually, and the session is kept **in memory only** (no persistent profile, cookies or screenshots). | `auth/browser.py` | P5, P6, P4 |
-| **Data-tier gate.** Every tool declares Public, Sensitive or Restricted. `PURDUE_MCP_AI_DATA_TIER` defaults to `public`, so **all Brightspace data tools refuse** until the user declares that their AI client is authorized for a higher tier. Grades need `restricted`. | `classification.py`, `policy.py` | P2, P3, P4 |
+| **Data-tier gate.** Every tool declares Public, Sensitive or Restricted. `PURDUE_MCP_AI_DATA_TIER` defaults to `sensitive`, which assumes a Purdue-authorized AI client used through Purdue SSO. **Grades, scores and feedback (Restricted) stay refused** until the user sets `restricted`. Setting `public` turns off every data tool. | `classification.py`, `policy.py` | P2, P3, P4 |
 | **Classification labels** on every result (`purdue_data_classification` plus handling text). | `sanitize.labelled` | P3, P4 |
 | **Per-course instructor-permission gate.** Instructor-authored text (announcement bodies, assignment instructions, event descriptions) is released only for course IDs listed in `PURDUE_MCP_AI_PERMITTED_COURSES`, after the student has checked the syllabus. `*` is rejected. Titles and dates stay available. | `policy.py`, `tools.py` | P8, P9 |
 | **Own data only.** Every per-course tool checks that the course is in the user's own enrollments. Only `my*` routes are used for grades and submissions. | `tools._require_own_course`, `client.ALLOWED_ROUTES` | P1, P7 |
@@ -59,11 +59,12 @@ falls short of it.
 
 ## 4. What code cannot settle (your responsibility)
 
-1. **Which tier to declare.** Set `PURDUE_MCP_AI_DATA_TIER` above `public` only if the AI client
-   you connect is on Purdue's current authorized list for that tier **and** you use it through
+1. **Which tier to declare.** The default, `sensitive`, is compliant only if the AI client you
+   connect is on Purdue's current authorized list for Sensitive data **and** you use it through
    Purdue SSO under Purdue's enterprise license. A personal Claude, ChatGPT or Gemini account
-   counts as Public-only, and with Public-only nothing but `compliance_status` works. That is
-   intended.
+   counts as Public-only: set `PURDUE_MCP_AI_DATA_TIER=public`, and then nothing but
+   `compliance_status` works. Set `restricted` (grades) only for a tool authorized for Restricted
+   data.
 2. **Your own records.** FERPA lets students share their own records. Purdue's AI policy is
    written around University data in general, and this server takes the cautious reading: a
    student's own grades are still treated as Restricted. If Purdue IT tells you otherwise for
