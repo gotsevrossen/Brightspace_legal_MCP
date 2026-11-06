@@ -29,6 +29,8 @@ Rules for the assistant:
   student's own grades). Do not use course materials to complete graded work unless the course
   syllabus allows it. Quiz and exam content is never available.
 - Never ask for the user's Purdue password or Duo codes. Sign-in happens only on Purdue's own page.
+- Refer to courses and assignments by name or code (for example "CS 18000"). Internal Brightspace
+  IDs are never shown.
 """
 
 READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=True)
@@ -60,7 +62,8 @@ def build_server(settings: Settings | None = None, tools: BrightspaceTools | Non
 
     @server.tool(annotations=READ_ONLY)
     async def list_courses(active_only: bool = True) -> dict[str, Any]:
-        """List the student's own Brightspace course enrollments with their course IDs.
+        """List the student's own Brightspace course enrollments (name, code, dates).
+        Other tools take a course name or code from this list, e.g. "CS 18000".
         Purdue Sensitive data."""
         return await t.list_courses(active_only)
 
@@ -71,33 +74,33 @@ def build_server(settings: Settings | None = None, tools: BrightspaceTools | Non
         return await t.upcoming_due_dates(days)
 
     @server.tool(annotations=READ_ONLY)
-    async def list_assignments(course_id: int) -> dict[str, Any]:
+    async def list_assignments(course: str) -> dict[str, Any]:
         """Assignment folders in one of the student's courses: names, due dates, points.
         Instructions are included only for courses with AI permission. Purdue Sensitive data."""
-        return await t.list_assignments(course_id)
+        return await t.list_assignments(course)
 
     @server.tool(annotations=READ_ONLY)
-    async def assignment_submission_status(course_id: int, folder_id: int) -> dict[str, Any]:
-        """Whether and when the student submitted to one assignment folder. Score and feedback
-        are included only at the Restricted tier."""
-        return await t.assignment_submission_status(course_id, folder_id)
+    async def assignment_submission_status(course: str, assignment: str) -> dict[str, Any]:
+        """Whether and when the student submitted one assignment, given the course and assignment
+        names. Score and feedback are included only at the Restricted tier."""
+        return await t.assignment_submission_status(course, assignment)
 
     @server.tool(annotations=READ_ONLY)
-    async def get_my_grades(course_id: int) -> dict[str, Any]:
+    async def get_my_grades(course: str) -> dict[str, Any]:
         """The student's own released grades in one course. Purdue Restricted data: available
         only when the AI client is authorized for Restricted data."""
-        return await t.get_my_grades(course_id)
+        return await t.get_my_grades(course)
 
     @server.tool(annotations=READ_ONLY)
-    async def get_announcements(course_id: int, limit: int = 10) -> dict[str, Any]:
+    async def get_announcements(course: str, limit: int = 10) -> dict[str, Any]:
         """Recent announcements in one course. Bodies are included only for courses with AI
         permission. Purdue Sensitive data."""
-        return await t.get_announcements(course_id, limit)
+        return await t.get_announcements(course, limit)
 
     @server.tool(annotations=READ_ONLY)
-    async def get_course_outline(course_id: int) -> dict[str, Any]:
+    async def get_course_outline(course: str) -> dict[str, Any]:
         """Module and topic titles for one course (no file contents). Purdue Sensitive data."""
-        return await t.get_course_outline(course_id)
+        return await t.get_course_outline(course)
 
     return server
 

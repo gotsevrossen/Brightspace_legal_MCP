@@ -11,6 +11,7 @@ own login page and nowhere else.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -60,10 +61,15 @@ def _env_int(name: str, default: int) -> int:
     return default if value is None else int(value)
 
 
-def _parse_course_ids(raw: str | None) -> frozenset[int]:
+def normalize_course_ref(value: str) -> str:
+    """'CS 18000', 'cs-18000' and 'CS18000' all normalize to 'cs18000'."""
+    return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
+def _parse_course_refs(raw: str | None) -> frozenset[str]:
     if not raw:
         return frozenset()
-    ids = set()
+    refs = set()
     for part in raw.split(","):
         part = part.strip()
         if not part:
@@ -71,11 +77,13 @@ def _parse_course_ids(raw: str | None) -> frozenset[int]:
         if part == "*":
             raise ValueError(
                 f"{ENV_PREFIX}AI_PERMITTED_COURSES does not accept '*'. AI permission is set "
-                "per course by each instructor's syllabus, so list each course ID you have "
-                "checked."
+                "per course by each instructor's syllabus, so list each course you have checked."
             )
-        ids.add(int(part))
-    return frozenset(ids)
+        ref = normalize_course_ref(part)
+        if len(ref) < 4:
+            raise ValueError(f"{ENV_PREFIX}AI_PERMITTED_COURSES entry {part!r} is too short to identify a course.")
+        refs.add(ref)
+    return frozenset(refs)
 
 
 def default_state_dir() -> Path:
@@ -92,9 +100,9 @@ class Settings:
     # SSO. Grades and feedback (Restricted) still need an explicit opt-in. Set
     # it to "public" when using a personal AI account.
     ai_data_tier: DataClass = DataClass.SENSITIVE
-    # Courses whose syllabus the user has checked and which permit AI tools to
-    # process course materials.
-    ai_permitted_courses: frozenset[int] = field(default_factory=frozenset)
+    # Courses (by code or the start of the name, e.g. "CS 18000") whose syllabus
+    # the user has checked and which permit AI tools to process course materials.
+    ai_permitted_courses: frozenset[str] = field(default_factory=frozenset)
 
     auth_mode: str = "oauth"
     base_url: str = DEFAULT_BASE_URL
@@ -126,7 +134,7 @@ class Settings:
         state_dir = _env("STATE_DIR")
         return cls(
             ai_data_tier=DataClass.parse(_env("AI_DATA_TIER", "sensitive") or "sensitive"),
-            ai_permitted_courses=_parse_course_ids(_env("AI_PERMITTED_COURSES")),
+            ai_permitted_courses=_parse_course_refs(_env("AI_PERMITTED_COURSES")),
             auth_mode=auth_mode,
             oauth_client_id=_env("OAUTH_CLIENT_ID"),
             oauth_client_secret=_env("OAUTH_CLIENT_SECRET"),

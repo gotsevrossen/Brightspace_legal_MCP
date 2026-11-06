@@ -22,6 +22,7 @@ original did that conflicts with them, and how this version handles each one.
 | Data sent to the AI | Everything, unlabelled | Gated by Purdue data tier (Public / Sensitive / Restricted), every result labelled (VII.A.5) |
 | Course materials | No limits | Instructor text only for courses whose syllabus you confirmed allows AI (I.A.1, academic integrity) |
 | Other students' data, quizzes, files | Not prevented | Blocked before any request (FERPA, academic integrity) |
+| Internal IDs | Course URLs exposed | Never shown to the AI. Courses and assignments are referred to by name; IDs stay inside the server |
 | Files on disk | JSON dump and screenshots | None, apart from a metadata-only audit log |
 | Load | Unlimited | 1 request/s at most, hourly cap, cache (VII.A.4) |
 
@@ -31,7 +32,7 @@ original did that conflicts with them, and how this version handles each one.
 |---|---|---|
 | `compliance_status` | Public | Shows the settings in force and why. No Brightspace request. |
 | `sign_in` / `sign_out` | – | Opens Purdue's sign-in page / ends the session and clears tokens. |
-| `list_courses` | Sensitive | Your enrollments and their course IDs. |
+| `list_courses` | Sensitive | Your enrollments: name, code, dates. Other tools take a course name or code, e.g. `CS 18000`. |
 | `upcoming_due_dates` | Sensitive | Calendar events for your active courses, up to 60 days ahead. |
 | `list_assignments` | Sensitive | Names, due dates, points. Instructions only for AI-permitted courses. |
 | `assignment_submission_status` | Sensitive / Restricted | Submission dates. Score and feedback only at the Restricted tier. |
@@ -72,7 +73,7 @@ password setting.
 | Variable | Default | Meaning |
 |---|---|---|
 | `PURDUE_MCP_AI_DATA_TIER` | `sensitive` | Highest Purdue data tier **your AI client is authorized for** on Purdue's AI tools list. `sensitive` (default) enables everything but grades and feedback. `restricted` enables those too. `public` disables every data tool. |
-| `PURDUE_MCP_AI_PERMITTED_COURSES` | *(none)* | Comma-separated course IDs whose syllabus you checked and which allow AI with course materials. `*` is rejected. |
+| `PURDUE_MCP_AI_PERMITTED_COURSES` | *(none)* | Comma-separated course codes (e.g. `CS 18000, MA 26100`) whose syllabus you checked and which allow AI with course materials. Matches the course code or the start of the course name, ignoring case and spacing. `*` is rejected. |
 | `PURDUE_MCP_AUTH_MODE` | `oauth` | `oauth` or `browser`. |
 | `PURDUE_MCP_OAUTH_CLIENT_ID` | – | Issued by Purdue's Brightspace admins for an approved OAuth 2.0 app. |
 | `PURDUE_MCP_OAUTH_CLIENT_SECRET` | – | Only if the registered app is confidential. Prefer the OS keyring or your client's secret store. |
@@ -102,7 +103,7 @@ Purdue's AI Use policy (VII.A.5) and its authorized AI tools list say:
       "command": "/absolute/path/to/Brightspace_legal_MCP/.venv/bin/purdue-brightspace-mcp",
       "env": {
         "PURDUE_MCP_AI_DATA_TIER": "sensitive",
-        "PURDUE_MCP_AI_PERMITTED_COURSES": "123456",
+        "PURDUE_MCP_AI_PERMITTED_COURSES": "CS 18000",
         "PURDUE_MCP_AUTH_MODE": "oauth",
         "PURDUE_MCP_OAUTH_CLIENT_ID": "issued-by-purdue"
       }

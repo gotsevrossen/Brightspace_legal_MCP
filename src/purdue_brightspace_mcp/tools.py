@@ -8,7 +8,7 @@ from typing import Any, Callable
 from .auth import SignInTransport, make_transport
 from .classification import CLASSIFICATION_RATIONALE, DataClass
 from .client import ALLOWED_ROUTES, FORBIDDEN_ROUTE_REASONS, AuthRequired, BrightspaceClient, BrightspaceHTTPError
-from .config import ENV_PREFIX, Settings
+from .config import ENV_PREFIX, Settings, normalize_course_ref
 from .policy import PolicyEngine, PolicyViolation
 from .sanitize import clean_text, labelled
 
@@ -61,9 +61,14 @@ class BrightspaceTools:
         except AuthRequired as exc:
             return {"status": "sign_in_required", "message": str(exc)}
         except BrightspaceHTTPError as exc:
-            return {"status": "brightspace_error", "message": str(exc)}
+            return {"status": "brightspace_error", "message": f"Brightspace returned HTTP {exc.status}."}
 
     async def _courses_by_id(self) -> dict[int, dict[str, Any]]:
+        """Enrollments keyed by Brightspace org unit ID.
+
+        The IDs stay inside the server: they are used to build API routes but are
+        never included in tool output. The AI refers to courses by name or code.
+        """
         if self._courses is None:
             client = self._get_client()
             versions = await client.versions()
@@ -77,27 +82,33 @@ class BrightspaceTools:
                 access = item.get("Access") or {}
                 if org.get("Id") is None:
                     continue
-                courses[int(org["Id"])] = {
-                    "course_id": int(org["Id"]),
+                course = {
                     "name": org.get("Name"),
                     "code": org.get("Code"),
                     "active": bool(access.get("IsActive")),
                     "can_access": bool(access.get("CanAccess")),
                     "start_date": _date(access.get("StartDate")),
                     "end_date": _date(access.get("EndDate")),
-                    "ai_course_materials_permitted": self.policy.course_content_permitted(int(org["Id"])),
                 }
+                course["ai_course_materials_permitted"] = self.policy.course_content_permitted(course)
+                courses[int(org["Id"])] = course
             self._courses = courses
         return self._courses
 
-    async def _require_own_course(self, course_id: int) -> dict[str, Any]:
+    async def _resolve_course(self, course: str) -> tuple[int, dict[str, Any]]:
+        """Find one of the user's own enrollments by code or name, e.g. 'CS 18000'."""
         courses = await self._courses_by_id()
-        if course_id not in courses:
-            raise PolicyViolation(
-                f"Course {course_id} is not one of your enrollments. This server only reads "
-                "data for courses you are enrolled in."
-            )
-        return courses[course_id]
+        return _resolve(course, courses, "course", lambda c: [c.get("code") or "", c.get("name") or ""],
+                        lambda c: c.get("name") or c.get("code") or "?",
+                        prefer=lambda c: c["active"] and c["can_access"],
+                        missing="is not one of your enrollments. This server only reads data for "
+                                "courses you are enrolled in.")
+
+    async def _folders(self, course_id: int) -> list[dict[str, Any]]:
+        client = self._get_client()
+        versions = await client.versions()
+        folders = await client.get(f"/d2l/api/le/{versions['le']}/{course_id}/dropbox/folders/")
+        return [f for f in (folders or []) if not f.get("IsHidden") and f.get("Id") is not None]
 
     # --------------------------------------------------------------------- tools
 
@@ -178,7 +189,7 @@ class BrightspaceTools:
         async def go() -> dict[str, Any]:
             self.policy.require("upcoming_due_dates", DataClass.SENSITIVE, days=days)
             window = max(1, min(int(days), 60))
-            courses = [c for c in (await self._courses_by_id()).values() if c["active"] and c["can_access"]]
+            courses = {cid: c for cid, c in (await self._courses_by_id()).items() if c["active"] and c["can_access"]}
             if not courses:
                 return labelled(DataClass.SENSITIVE, {"events": []})
             client = self._get_client()
@@ -188,7 +199,7 @@ class BrightspaceTools:
             page = await client.get(
                 f"/d2l/api/le/{versions['le']}/calendar/events/myEvents/",
                 {
-                    "orgUnitIdsCSV": ",".join(str(c["course_id"]) for c in courses),
+                    "orgUnitIdsCSV": ",".join(str(cid) for cid in courses),
                     "startDateTime": now.strftime(fmt),
                     "endDateTime": (now + dt.timedelta(days=window)).strftime(fmt),
                 },
@@ -196,16 +207,16 @@ class BrightspaceTools:
             raw = page.get("Objects", []) if isinstance(page, dict) else (page or [])
             events = []
             for ev in raw:
-                course_id = ev.get("OrgUnitId")
+                org_id = ev.get("OrgUnitId")
+                course = courses.get(int(org_id)) if org_id is not None else None
                 entry = {
                     "title": ev.get("Title"),
-                    "course_id": course_id,
-                    "course": ev.get("OrgUnitName") or ev.get("OrgUnitCode"),
+                    "course": (course or {}).get("name") or ev.get("OrgUnitName") or ev.get("OrgUnitCode"),
                     "start": ev.get("StartDateTime"),
                     "end": ev.get("EndDateTime"),
                     "all_day": ev.get("IsAllDayEvent"),
                 }
-                if course_id is not None and self.policy.course_content_permitted(int(course_id)):
+                if course is not None and course["ai_course_materials_permitted"]:
                     entry["description"] = clean_text({"Text": ev.get("Description")}, 500)
                 events.append(entry)
             events.sort(key=lambda e: e.get("end") or e.get("start") or "")
@@ -213,21 +224,15 @@ class BrightspaceTools:
 
         return await self._run(go)
 
-    async def list_assignments(self, course_id: int) -> dict[str, Any]:
+    async def list_assignments(self, course: str) -> dict[str, Any]:
         async def go() -> dict[str, Any]:
-            self.policy.require("list_assignments", DataClass.SENSITIVE, course_id=course_id)
-            await self._require_own_course(course_id)
-            client = self._get_client()
-            versions = await client.versions()
-            folders = await client.get(f"/d2l/api/le/{versions['le']}/{course_id}/dropbox/folders/")
-            permitted = self.policy.course_content_permitted(course_id)
+            self.policy.require("list_assignments", DataClass.SENSITIVE, course=course)
+            course_id, info = await self._resolve_course(course)
+            permitted = info["ai_course_materials_permitted"]
             out = []
-            for f in folders or []:
-                if f.get("IsHidden"):
-                    continue
+            for f in await self._folders(course_id):
                 avail = f.get("Availability") or {}
                 item = {
-                    "folder_id": f.get("Id"),
                     "name": f.get("Name"),
                     "due_date": f.get("DueDate"),
                     "available_from": avail.get("StartDate"),
@@ -237,21 +242,25 @@ class BrightspaceTools:
                 if permitted:
                     item["instructions"] = clean_text(f.get("CustomInstructions"), self.settings.max_text_chars)
                 out.append(item)
-            notes = None if permitted else [self.policy.course_permission_note(course_id)]
-            return labelled(DataClass.SENSITIVE, {"course_id": course_id, "assignments": out}, notes)
+            notes = None if permitted else [self.policy.course_permission_note(info["name"])]
+            return labelled(DataClass.SENSITIVE, {"course": info["name"], "assignments": out}, notes)
 
         return await self._run(go)
 
-    async def assignment_submission_status(self, course_id: int, folder_id: int) -> dict[str, Any]:
+    async def assignment_submission_status(self, course: str, assignment: str) -> dict[str, Any]:
         async def go() -> dict[str, Any]:
             self.policy.require(
-                "assignment_submission_status", DataClass.SENSITIVE, course_id=course_id, folder_id=folder_id
+                "assignment_submission_status", DataClass.SENSITIVE, course=course, assignment=assignment
             )
-            await self._require_own_course(course_id)
+            course_id, info = await self._resolve_course(course)
+            folders = {int(f["Id"]): f for f in await self._folders(course_id)}
+            folder_id, folder = _resolve(assignment, folders, "assignment", lambda f: [f.get("Name") or ""],
+                                         lambda f: f.get("Name") or "?",
+                                         missing=f"was not found in {info['name']}.")
             client = self._get_client()
             versions = await client.versions()
             entries = await client.get(
-                f"/d2l/api/le/{versions['le']}/{course_id}/dropbox/folders/{int(folder_id)}/submissions/mysubmissions/"
+                f"/d2l/api/le/{versions['le']}/{course_id}/dropbox/folders/{folder_id}/submissions/mysubmissions/"
             )
             include_feedback = self.settings.ai_data_tier >= DataClass.RESTRICTED
             results = []
@@ -275,14 +284,16 @@ class BrightspaceTools:
             data_class = DataClass.RESTRICTED if include_feedback else DataClass.SENSITIVE
             if not include_feedback:
                 notes = ["Scores and feedback are Restricted data and were withheld at the current tier."]
-            return labelled(data_class, {"course_id": course_id, "folder_id": folder_id, "entries": results}, notes)
+            return labelled(
+                data_class, {"course": info["name"], "assignment": folder.get("Name"), "entries": results}, notes
+            )
 
         return await self._run(go)
 
-    async def get_my_grades(self, course_id: int) -> dict[str, Any]:
+    async def get_my_grades(self, course: str) -> dict[str, Any]:
         async def go() -> dict[str, Any]:
-            self.policy.require("get_my_grades", DataClass.RESTRICTED, course_id=course_id)
-            await self._require_own_course(course_id)
+            self.policy.require("get_my_grades", DataClass.RESTRICTED, course=course)
+            course_id, info = await self._resolve_course(course)
             client = self._get_client()
             versions = await client.versions()
             values = await client.get(f"/d2l/api/le/{versions['le']}/{course_id}/grades/values/myGradeValues/")
@@ -307,18 +318,18 @@ class BrightspaceTools:
                              "points_possible": fv.get("PointsDenominator")}
             except BrightspaceHTTPError:
                 final = None  # not released to students
-            return labelled(DataClass.RESTRICTED, {"course_id": course_id, "grades": grades, "final_grade": final})
+            return labelled(DataClass.RESTRICTED, {"course": info["name"], "grades": grades, "final_grade": final})
 
         return await self._run(go)
 
-    async def get_announcements(self, course_id: int, limit: int = 10) -> dict[str, Any]:
+    async def get_announcements(self, course: str, limit: int = 10) -> dict[str, Any]:
         async def go() -> dict[str, Any]:
-            self.policy.require("get_announcements", DataClass.SENSITIVE, course_id=course_id)
-            await self._require_own_course(course_id)
+            self.policy.require("get_announcements", DataClass.SENSITIVE, course=course)
+            course_id, info = await self._resolve_course(course)
             client = self._get_client()
             versions = await client.versions()
             items = await client.get(f"/d2l/api/le/{versions['le']}/{course_id}/news/")
-            permitted = self.policy.course_content_permitted(course_id)
+            permitted = info["ai_course_materials_permitted"]
             items = sorted(items or [], key=lambda n: n.get("StartDate") or n.get("CreatedDate") or "", reverse=True)
             out = []
             for n in items[: max(1, min(int(limit), 25))]:
@@ -328,15 +339,15 @@ class BrightspaceTools:
                 if permitted:
                     entry["body"] = clean_text(n.get("Body"), self.settings.max_text_chars)
                 out.append(entry)
-            notes = None if permitted else [self.policy.course_permission_note(course_id)]
-            return labelled(DataClass.SENSITIVE, {"course_id": course_id, "announcements": out}, notes)
+            notes = None if permitted else [self.policy.course_permission_note(info["name"])]
+            return labelled(DataClass.SENSITIVE, {"course": info["name"], "announcements": out}, notes)
 
         return await self._run(go)
 
-    async def get_course_outline(self, course_id: int) -> dict[str, Any]:
+    async def get_course_outline(self, course: str) -> dict[str, Any]:
         async def go() -> dict[str, Any]:
-            self.policy.require("get_course_outline", DataClass.SENSITIVE, course_id=course_id)
-            await self._require_own_course(course_id)
+            self.policy.require("get_course_outline", DataClass.SENSITIVE, course=course)
+            course_id, info = await self._resolve_course(course)
             client = self._get_client()
             versions = await client.versions()
             toc = await client.get(f"/d2l/api/le/{versions['le']}/{course_id}/content/toc")
@@ -362,7 +373,7 @@ class BrightspaceTools:
             return labelled(
                 DataClass.SENSITIVE,
                 {
-                    "course_id": course_id,
+                    "course": info["name"],
                     "outline": walk((toc or {}).get("Modules") or []),
                     "note": "Titles only. File contents are never downloaded.",
                 },
@@ -373,3 +384,30 @@ class BrightspaceTools:
     async def close(self) -> None:
         if self._client is not None:
             await self._client.close()
+
+
+def _norm(value: str) -> str:
+    return normalize_course_ref(value or "")
+
+
+def _resolve(query, items, kind, keys, label, prefer=None, missing="was not found."):
+    """Match a user-supplied name against items without exposing internal IDs.
+
+    Exact (normalized) matches win, then substring matches. If several remain,
+    `prefer` (e.g. "is active") breaks the tie; otherwise the user is asked to
+    be more specific, with the candidate names listed.
+    """
+    q = _norm(str(query))
+    if not q:
+        raise PolicyViolation(f"Give a {kind} name.")
+    exact = [(k, v) for k, v in items.items() if any(_norm(x) == q for x in keys(v))]
+    matches = exact or [(k, v) for k, v in items.items() if any(q in _norm(x) for x in keys(v))]
+    if len(matches) > 1 and prefer is not None:
+        preferred = [m for m in matches if prefer(m[1])]
+        matches = preferred or matches
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise PolicyViolation(f"{kind.capitalize()} {query!r} {missing}")
+    names = sorted({label(v) for _, v in matches})
+    raise PolicyViolation(f"{kind.capitalize()} {query!r} matches more than one: {names}. Be more specific.")

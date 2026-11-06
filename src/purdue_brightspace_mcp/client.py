@@ -76,9 +76,9 @@ class Transport(Protocol):
 def check_route(path: str) -> None:
     for pattern, reason in FORBIDDEN_ROUTE_REASONS:
         if pattern.search(path):
-            raise PolicyViolation(f"Blocked route {path}: {reason}")
+            raise PolicyViolation(f"Blocked request: {reason}")
     if not any(p.match(path) for p in ALLOWED_ROUTES):
-        raise PolicyViolation(f"Blocked route {path}: not on this server's read-only allowlist.")
+        raise PolicyViolation("Blocked request: the route is not on this server's read-only allowlist.")
 
 
 class RateLimiter:

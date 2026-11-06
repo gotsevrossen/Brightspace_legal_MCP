@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from .classification import DataClass
-from .config import ENV_PREFIX, Settings
+from .config import ENV_PREFIX, Settings, normalize_course_ref
 
 
 class PolicyViolation(Exception):
@@ -74,8 +74,11 @@ class PolicyEngine:
             "Purdue SSO.",
         )
 
-    def course_content_permitted(self, course_id: int) -> bool:
-        return course_id in self.settings.ai_permitted_courses
+    def course_content_permitted(self, course: dict[str, Any]) -> bool:
+        """True if a configured entry matches the course code, or the start of its name."""
+        code = normalize_course_ref(course.get("code") or "")
+        name = normalize_course_ref(course.get("name") or "")
+        return any(ref == code or name.startswith(ref) for ref in self.settings.ai_permitted_courses)
 
     def require(self, tool: str, data_class: DataClass, **context: Any) -> None:
         decision = self.check_tier(tool, data_class)
@@ -89,9 +92,9 @@ class PolicyEngine:
         if not decision.allowed:
             raise PolicyViolation(decision.reason)
 
-    def course_permission_note(self, course_id: int) -> str:
+    def course_permission_note(self, course_name: str) -> str:
         return (
-            f"Instructor-authored text for course {course_id} was withheld. Add {course_id} to "
+            f"Instructor-authored text for {course_name} was withheld. Add this course's code to "
             f"{ENV_PREFIX}AI_PERMITTED_COURSES only after you have checked that the course "
             "syllabus allows AI tools to be used with course materials."
         )

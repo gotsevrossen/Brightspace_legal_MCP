@@ -104,7 +104,7 @@ class FakeTransport:
         pass
 
 
-def make_settings(tmp_path, tier: DataClass = DataClass.SENSITIVE, permitted=(101,), **kw) -> Settings:
+def make_settings(tmp_path, tier: DataClass = DataClass.SENSITIVE, permitted=("cs18000",), **kw) -> Settings:
     return Settings(
         ai_data_tier=tier,
         ai_permitted_courses=frozenset(permitted),

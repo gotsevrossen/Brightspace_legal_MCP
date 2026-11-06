@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -26,10 +27,10 @@ async def test_default_tier_is_sensitive_but_grades_stay_restricted(tmp_path, tr
     assert tools.settings.ai_data_tier is DataClass.SENSITIVE
     assert Settings().ai_data_tier is DataClass.SENSITIVE
     assert (await tools.list_courses())["purdue_data_classification"] == "Sensitive"
-    assert (await tools.get_announcements(101))["purdue_data_classification"] == "Sensitive"
-    assert (await tools.get_my_grades(101))["status"] == "refused_by_policy"
+    assert (await tools.get_announcements("CS 18000"))["purdue_data_classification"] == "Sensitive"
+    assert (await tools.get_my_grades("CS 18000"))["status"] == "refused_by_policy"
     assert not any("grades" in path for path, _ in transport.calls)
-    status = await tools.assignment_submission_status(101, 9)
+    status = await tools.assignment_submission_status("CS 18000", "Project 2")
     assert "feedback" not in status["entries"][0]
 
 
@@ -39,20 +40,20 @@ async def test_public_tier_refuses_everything(tmp_path, transport, monkeypatch):
     from purdue_brightspace_mcp.tools import BrightspaceTools
 
     tools = BrightspaceTools(Settings.from_env(), transport_factory=lambda s: transport)
-    for result in [await tools.list_courses(), await tools.get_my_grades(101), await tools.get_announcements(101)]:
+    for result in [await tools.list_courses(), await tools.get_my_grades("CS 18000"), await tools.get_announcements("CS 18000")]:
         assert result["status"] == "refused_by_policy"
     assert transport.calls == []  # nothing was fetched
 
 
 async def test_grades_need_restricted_tier(make_tools, transport):
-    result = await make_tools(tier=DataClass.SENSITIVE).get_my_grades(101)
+    result = await make_tools(tier=DataClass.SENSITIVE).get_my_grades("CS 18000")
     assert result["status"] == "refused_by_policy"
     assert "VII.A.5" in result["message"]
     assert not any("grades" in path for path, _ in transport.calls)
 
 
 async def test_grades_allowed_at_restricted(make_tools):
-    result = await make_tools(tier=DataClass.RESTRICTED).get_my_grades(101)
+    result = await make_tools(tier=DataClass.RESTRICTED).get_my_grades("CS 18000")
     assert result["purdue_data_classification"] == "Restricted"
     assert result["grades"][0]["displayed_grade"] == "95 %"
     assert result["final_grade"] is None  # 404 -> not released
@@ -60,49 +61,80 @@ async def test_grades_allowed_at_restricted(make_tools):
 
 async def test_instructor_text_requires_course_permission(make_tools):
     tools = make_tools()
-    permitted = await tools.get_announcements(101)
+    permitted = await tools.get_announcements("CS 18000")
     assert "body" in permitted["announcements"][0]
     assert "policy_notes" not in permitted
 
-    withheld = await tools.get_announcements(202)
+    withheld = await tools.get_announcements("MA 26100")
     assert "body" not in withheld["announcements"][0]
     assert "AI_PERMITTED_COURSES" in withheld["policy_notes"][0]
 
 
 async def test_identifiers_are_redacted(make_tools):
-    body = (await make_tools().get_announcements(101))["announcements"][0]["body"]
+    body = (await make_tools().get_announcements("CS 18000"))["announcements"][0]["body"]
     assert "@" not in body and "0012345678" not in body
     assert "[email removed]" in body and "[ID removed]" in body
 
 
 async def test_assignments_drop_class_wide_and_staff_fields(make_tools):
-    result = await make_tools().list_assignments(101)
+    result = await make_tools().list_assignments("CS 18000")
     item = result["assignments"][0]
     assert item["instructions"] == "Write a parser"
     assert "TotalUsers" not in json.dumps(result) and "prof@purdue.edu" not in json.dumps(result)
 
 
 async def test_course_must_be_own_enrollment(make_tools, transport):
-    result = await make_tools().list_assignments(999)
-    assert result["status"] == "refused_by_policy"
-    assert not any("/999/" in path for path, _ in transport.calls)
+    result = await make_tools().list_assignments("PHYS 17200")
+    assert result["status"] == "refused_by_policy" and "not one of your enrollments" in result["message"]
+    assert not any("dropbox" in path for path, _ in transport.calls)
+
+
+async def test_ambiguous_course_asks_for_more_detail(make_tools):
+    result = await make_tools().list_assignments("Fall 2026")
+    assert result["status"] == "refused_by_policy" and "more than one" in result["message"]
+
+
+async def test_course_matching_ignores_case_and_spacing(make_tools):
+    for ref in ["cs18000", "CS-18000", "cs 18000 fall"]:
+        assert (await make_tools().list_assignments(ref))["course"] == "CS 18000 Fall 2026"
+
+
+async def test_no_internal_ids_in_any_output(make_tools):
+    tools = make_tools(tier=DataClass.RESTRICTED)
+    outputs = [
+        await tools.list_courses(),
+        await tools.upcoming_due_dates(14),
+        await tools.list_assignments("CS 18000"),
+        await tools.assignment_submission_status("CS 18000", "Project 2"),
+        await tools.get_my_grades("CS 18000"),
+        await tools.get_announcements("CS 18000"),
+        await tools.get_announcements("MA 26100"),
+        await tools.get_course_outline("CS 18000"),
+        await tools.list_assignments("PHYS 17200"),
+    ]
+    text = json.dumps(outputs)
+    for key in ['"course_id"', '"folder_id"', '"Id"', '"OrgUnitId"', '"id"']:
+        assert key not in text, key
+    for internal_id in ["101", "202", "555"]:
+        assert not re.search(rf"(?<!\d){internal_id}(?!\d)", text), internal_id
 
 
 async def test_submission_feedback_only_at_restricted(make_tools):
-    sensitive = await make_tools(tier=DataClass.SENSITIVE).assignment_submission_status(101, 9)
+    sensitive = await make_tools(tier=DataClass.SENSITIVE).assignment_submission_status("CS 18000", "Project 2")
     assert sensitive["purdue_data_classification"] == "Sensitive"
     assert "feedback" not in sensitive["entries"][0]
 
-    restricted = await make_tools(tier=DataClass.RESTRICTED).assignment_submission_status(101, 9)
+    restricted = await make_tools(tier=DataClass.RESTRICTED).assignment_submission_status("CS 18000", "Project 2")
     assert restricted["purdue_data_classification"] == "Restricted"
     assert restricted["entries"][0]["feedback"]["score"] == 88
 
 
 async def test_due_dates_gate_descriptions_per_course(make_tools, transport):
     result = await make_tools().upcoming_due_dates(7)
-    by_course = {e["course_id"]: e for e in result["events"]}
-    assert "description" in by_course[101] and "@" not in by_course[101]["description"]
-    assert "description" not in by_course[202]
+    by_course = {e["course"]: e for e in result["events"]}
+    cs, ma = by_course["CS 18000 Fall 2026"], by_course["MA 26100 Fall 2026"]
+    assert "description" in cs and "@" not in cs["description"]
+    assert "description" not in ma
     _, query = next(c for c in transport.calls if "calendar" in c[0])
     assert query["orgUnitIdsCSV"] == ["101,202"]
 
@@ -124,6 +156,11 @@ def test_routes_outside_allowlist_are_blocked(path):
         check_route(path)
 
 
+def test_permitted_courses_use_codes_not_ids(monkeypatch):
+    monkeypatch.setenv("PURDUE_MCP_AI_PERMITTED_COURSES", "CS 18000, ma-26100")
+    assert Settings.from_env().ai_permitted_courses == frozenset({"cs18000", "ma26100"})
+
+
 def test_wildcard_course_permission_rejected(monkeypatch):
     monkeypatch.setenv("PURDUE_MCP_AI_PERMITTED_COURSES", "*")
     with pytest.raises(ValueError):
@@ -143,7 +180,7 @@ def test_no_credential_settings_exist():
 
 
 async def test_audit_log_has_metadata_not_content(make_tools, tmp_path):
-    await make_tools().get_announcements(101)
+    await make_tools().get_announcements("CS 18000")
     log = (tmp_path / "audit.jsonl").read_text()
     assert "get_announcements" in log and "Project 2 posted" not in log
     assert oct((tmp_path / "audit.jsonl").stat().st_mode & 0o777) == "0o600"
@@ -152,7 +189,7 @@ async def test_audit_log_has_metadata_not_content(make_tools, tmp_path):
 async def test_rate_limiter_hourly_cap(make_tools):
     tools = make_tools(max_requests_per_hour=2)
     # versions + enrollments use the 2 allowed requests; the next distinct call is refused.
-    result = await tools.get_announcements(101)
+    result = await tools.get_announcements("CS 18000")
     assert result["status"] == "refused_by_policy" and "Hourly request limit" in result["message"]
 
 
