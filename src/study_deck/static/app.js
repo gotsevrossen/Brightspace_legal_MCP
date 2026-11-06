@@ -15,6 +15,7 @@ const ICON = {
   alert: '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>',
   info: '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5h.01"/></svg>',
   file: '<svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M12 17v-6M9.5 13.5 12 11l2.5 2.5"/></svg>',
+  gear: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>',
   cards: '<svg viewBox="0 0 64 64" width="64" height="64" aria-hidden="true"><rect x="8" y="10" width="30" height="42" rx="6" fill="#CFB991" transform="rotate(-8 23 31)"/><rect x="22" y="10" width="32" height="44" rx="6" fill="#000"/><path d="M29 24h18M29 32h18M29 40h11" stroke="#CFB991" stroke-width="3" stroke-linecap="round"/></svg>',
 };
 
@@ -81,7 +82,8 @@ async function loadMe() {
   me = await api("/api/me");
   const bs = me.brightspace;
   topRight.innerHTML = `${me.demo_mode ? '<span class="pill gold">Demo mode</span>' : ""}
-    <span class="pill"><span class="dot ${bs.connected ? "on" : ""}"></span>${bs.connected ? `Brightspace · ${bs.courses} course${bs.courses === 1 ? "" : "s"}` : "Brightspace not connected"}</span>`;
+    <span class="pill"><span class="dot ${bs.connected ? "on" : ""}"></span>${bs.connected ? `Brightspace · ${bs.courses} course${bs.courses === 1 ? "" : "s"}` : "Brightspace not connected"}</span>
+    <a class="pill pill-link" href="#/settings">${ICON.gear}Settings</a>`;
   return me;
 }
 
@@ -97,6 +99,7 @@ async function route() {
     await loadMe();
     const parts = (location.hash || "#/").slice(2).split("/");
     if (parts[0] === "host") await hostView();
+    else if (parts[0] === "settings") settingsView();
     else if (parts[0] === "game" && parts[1]) await gameView(parts[1].toUpperCase());
     else homeView(parts[0] === "join" ? (parts[1] || "") : "");
   } catch (e) {
@@ -165,6 +168,80 @@ function homeView(prefill) {
   if (dc) dc.addEventListener("click", () => guarded(dc, async () => { await api("/api/brightspace/disconnect", { method: "POST" }); route(); }));
 }
 
+/* ---------------------------------------------------------------- settings */
+
+function genaiCardHTML(g, models) {
+  const source = { yours: "entered here, kept in this app's memory until you go idle", saved: "remembered in this computer's system keychain", server: "set up by whoever runs this server" }[g.source];
+  const list = models && models.length ? models : g.configured ? [g.model] : [];
+  return `
+    <div class="card-head"><div><p class="eyebrow">Question writer</p><h2>Purdue GenAI Studio</h2></div>
+      <span class="pill"><span class="dot ${g.configured ? "on" : ""}"></span>${g.configured ? `Connected · ${esc(g.model)}` : "Not set up"}</span></div>
+    ${g.configured ? `<p class="small muted">Using the key ${esc(g.key_hint || "")} ${source ? `(${esc(source)})` : ""}.</p>` : ""}
+    <form id="genaiForm" class="grid" novalidate>
+      <label class="f">API key
+        <input class="input" name="key" type="password" autocomplete="off" spellcheck="false" placeholder="${g.configured ? "Paste a new key to replace it" : "Paste your API key"}">
+        <span class="hint">Get one at <a href="https://genai.rcac.purdue.edu" target="_blank" rel="noopener noreferrer">genai.rcac.purdue.edu</a>: sign in with your Purdue account, then create an API key in your account settings.</span>
+      </label>
+      <div class="row grow-first">
+        <label class="f">Model
+          <select class="input" name="model" ${list.length ? "" : "disabled"}>${list.length ? list.map((m) => `<option ${m === g.model ? "selected" : ""}>${esc(m)}</option>`).join("") : "<option>Check your key to see models</option>"}</select>
+        </label>
+        <button class="btn line" type="button" id="checkKey">Check key</button>
+      </div>
+      ${g.can_remember ? `<label class="check"><input type="checkbox" name="remember" ${g.remembered ? "checked" : ""}><span>Remember on this computer. It's stored in your system keychain, not in a file, and only used when you open the app here.</span></label>` : ""}
+      <div class="row">
+        <button class="btn gold" type="submit">Save</button>
+        ${g.source === "yours" || g.source === "saved" ? '<button class="linkbtn" type="button" id="forgetKey">Remove key</button>' : ""}
+      </div>
+      <p class="hint">Your key is only sent to Purdue GenAI Studio and is never shown to other players. Only course text goes to the model: no names or grades.</p>
+    </form>`;
+}
+
+function settingsView() {
+  main.innerHTML = `
+    <section><p class="eyebrow">Settings</p><h1>Settings</h1>
+      <p class="lede">Connect the services Study Deck uses. Everything here applies to you only.</p></section>
+    <section class="card" id="genaiCard"></section>
+    ${connectCard()}`;
+  const card = $("#genaiCard");
+  const paint = (g, models) => {
+    card.innerHTML = genaiCardHTML(g, models);
+    const form = $("#genaiForm", card);
+    const fill = (list) => {
+      const sel = form.model;
+      sel.disabled = false;
+      sel.innerHTML = list.map((m) => `<option ${m === g.model ? "selected" : ""}>${esc(m)}</option>`).join("");
+    };
+    $("#checkKey", card).addEventListener("click", (e) => guarded(e.currentTarget, async () => {
+      const { models: list } = await api("/api/settings/genai/models", { method: "POST", json: { key: form.key.value } });
+      fill(list);
+      toast(`Key works. ${list.length} model${list.length === 1 ? "" : "s"} available.`);
+    }));
+    form.addEventListener("submit", (e) => {
+      e.preventDefault();
+      guarded($("button[type=submit]", form), async () => {
+        const res = await api("/api/settings/genai", {
+          method: "POST",
+          json: { key: form.key.value, model: form.model.disabled ? "" : form.model.value, remember: form.remember ? form.remember.checked : false },
+        });
+        me.genai = res.genai;
+        paint(res.genai, res.models);
+        toast("Saved. New games will use Purdue GenAI Studio.");
+      });
+    });
+    const forget = $("#forgetKey", card);
+    if (forget) forget.addEventListener("click", () => guarded(forget, async () => {
+      const res = await api("/api/settings/genai/forget", { method: "POST" });
+      me.genai = res.genai;
+      paint(res.genai);
+      toast("Key removed.");
+    }));
+  };
+  paint(me.genai);
+  const dc = $("#disconnect");
+  if (dc) dc.addEventListener("click", () => guarded(dc, async () => { await api("/api/brightspace/disconnect", { method: "POST" }); route(); }));
+}
+
 /* -------------------------------------------------------------------- host */
 
 const setup = { entries: [], types: "both", size: 20 };
@@ -200,9 +277,9 @@ async function hostView() {
     <section class="card step">
       <h2><span class="step-num">3</span>Start</h2>
       <label class="f">Your first name<input class="input" id="hostName" maxlength="24" autocomplete="given-name" value="${esc(me.name)}"></label>
-      ${me.genai.server_key ? "" : `<label class="f">Purdue GenAI Studio API key${me.genai.offline_demo ? " (optional)" : ""}
-        <input class="input" id="genaiKey" type="password" autocomplete="off" spellcheck="false" placeholder="${me.genai.offline_demo ? "Leave empty to use the offline demo writer" : "Paste your key"}">
-        <span class="hint">Create a key in your Purdue GenAI Studio account settings. It's kept in server memory for this game only and never shown to players.</span></label>`}
+      ${me.genai.configured
+        ? `<div class="notice demo">${ICON.info}<p class="small">Cards will be written by <b>Purdue GenAI Studio</b> using <b>${esc(me.genai.model)}</b>. <a href="#/settings">Change in Settings</a></p></div>`
+        : `<div class="notice">${ICON.info}<p class="small">${me.genai.offline_demo ? "Cards will be written by the simple offline demo writer. For real AI questions, " : "To write questions, "}<a href="#/settings">add your Purdue GenAI Studio key in Settings</a>.</p></div>`}
       <div id="permissions" class="grid"></div>
       <button class="btn gold big wide" id="createBtn" type="button">Create game</button>
     </section>`;

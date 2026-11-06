@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
@@ -29,11 +30,25 @@ from .brightspace import Course, DemoSource, LiveSource, Source, TokenTransport,
 from .config import StudyDeckSettings
 from .extract import UnsupportedFile, extract_text
 from .game import GameSession, Player, SessionStore, Stratum, make_chunks, spawn
+from . import genai as genai_mod
 from .genai import QUESTION_TYPES, GenAIStudio, GenerationError, Generator, OfflineGenerator
 
 log = logging.getLogger("study_deck")
 STATIC = Path(__file__).parent / "static"
 NAME_MAX = 24
+KEYRING_SERVICE = "study-deck"
+LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _keyring():
+    """The OS keychain (macOS Keychain, Windows Credential Manager, Secret Service), or None."""
+    try:
+        import keyring  # noqa: PLC0415
+        from keyring.backends.fail import Keyring as NoKeyring  # noqa: PLC0415
+
+        return None if isinstance(keyring.get_keyring(), NoKeyring) else keyring
+    except Exception:
+        return None
 
 
 class ApiError(Exception):
@@ -50,6 +65,8 @@ class User:
     courses: dict[int, Course] = field(default_factory=dict)
     pending: tuple[str, str] | None = None  # OAuth state, PKCE verifier
     next_url: str = "/#connected"
+    genai_key: str | None = None  # entered on the Settings page; memory only
+    genai_model: str | None = None
     last_active: float = field(default_factory=time.time)
     hits: list[float] = field(default_factory=list)
 
@@ -117,13 +134,44 @@ class StudyDeck:
             player.verified_org_ids = known.verified if known else frozenset()
         return session
 
-    def make_generator(self, key: str | None) -> Generator:
-        key = (key or "").strip() or self.settings.genai_api_key
+    # ------------------------------------------------------- GenAI Studio key
+
+    def is_local(self, request: Request) -> bool:
+        """True when this server only serves this computer: the OS keychain is then the user's own."""
+        public = urlsplit(self.settings.public_url).hostname or ""
+        client = request.client.host if request.client else ""
+        return public in LOCAL_HOSTS and client in LOCAL_HOSTS
+
+    def saved_genai(self) -> tuple[str | None, str | None]:
+        kr = _keyring()
+        if kr is None:
+            return None, None
+        try:
+            return kr.get_password(KEYRING_SERVICE, "genai_api_key"), kr.get_password(KEYRING_SERVICE, "genai_model")
+        except Exception:
+            return None, None
+
+    def effective_genai(self, user: User, request: Request) -> tuple[str | None, str, str | None]:
+        """(key, model, source) used when this user hosts a game. Source: yours | saved | server."""
+        model = user.genai_model or self.settings.genai_model
+        if user.genai_key:
+            return user.genai_key, model, "yours"
+        if self.is_local(request):
+            saved_key, saved_model = self.saved_genai()
+            if saved_key:
+                return saved_key, user.genai_model or saved_model or self.settings.genai_model, "saved"
+        if self.settings.genai_api_key:
+            return self.settings.genai_api_key, model, "server"
+        return None, model, None
+
+    def make_generator(self, form_key: str | None, user: User, request: Request) -> Generator:
+        key, model, _ = self.effective_genai(user, request)
+        key = (form_key or "").strip() or key
         if key:
-            return GenAIStudio(self.settings.genai_url, self.settings.genai_model, key)
+            return GenAIStudio(self.settings.genai_url, model, key)
         if self.settings.demo_mode:
             return OfflineGenerator()
-        raise ApiError("A Purdue GenAI Studio API key is needed to write questions.")
+        raise ApiError("Add your Purdue GenAI Studio API key in Settings to write questions.")
 
     async def load_courses(self, user: User) -> None:
         assert user.source is not None
@@ -209,9 +257,75 @@ def create_app(settings: StudyDeckSettings | None = None) -> Starlette:
             "brightspace": {"connected": user.source is not None,
                             "mode": user.source.kind if user.source else None,
                             "courses": len(user.courses)},
-            "genai": {"server_key": bool(settings.genai_api_key), "model": settings.genai_model,
-                      "offline_demo": settings.demo_mode and not settings.genai_api_key},
+            "genai": genai_status(user, request),
         })
+
+    # ---------------------------------------------------------------- settings
+
+    def genai_status(user: User, request: Request) -> dict[str, Any]:
+        key, model, source = deck.effective_genai(user, request)
+        return {
+            "configured": bool(key),
+            "source": source,
+            "key_hint": f"…{key[-4:]}" if key and len(key) > 8 else None,
+            "model": model,
+            "offline_demo": settings.demo_mode and not key,
+            "can_remember": deck.is_local(request) and _keyring() is not None,
+            "remembered": source == "saved" or (deck.is_local(request) and bool(deck.saved_genai()[0])),
+        }
+
+    async def genai_models(request: Request) -> Response:
+        user = deck.user_for(request)
+        key = str((await body(request)).get("key") or "").strip() or deck.effective_genai(user, request)[0]
+        if not key:
+            raise ApiError("Paste your GenAI Studio API key first.")
+        try:
+            models = await genai_mod.list_models(settings.genai_url, key)
+        except GenerationError as exc:
+            raise ApiError(str(exc)) from exc
+        return JSONResponse({"models": models})
+
+    async def genai_save(request: Request) -> Response:
+        user = deck.user_for(request)
+        data = await body(request)
+        key = str(data.get("key") or "").strip()
+        current = deck.effective_genai(user, request)[0]
+        check_key = key or current
+        if not check_key:
+            raise ApiError("Paste your GenAI Studio API key first.")
+        if len(check_key) > 400:
+            raise ApiError("That doesn't look like a GenAI Studio API key.")
+        try:
+            models = await genai_mod.list_models(settings.genai_url, check_key)
+        except GenerationError as exc:
+            raise ApiError(str(exc)) from exc
+        model = str(data.get("model") or "").strip() or (models[0] if models else settings.genai_model)
+        if model not in models:
+            raise ApiError("Pick a model from the list.")
+        if key:
+            user.genai_key = key
+        user.genai_model = model
+        if data.get("remember"):
+            kr = _keyring() if deck.is_local(request) else None
+            if kr is None:
+                raise ApiError("Remembering the key only works when the app runs on your own computer.")
+            kr.set_password(KEYRING_SERVICE, "genai_api_key", check_key)
+            kr.set_password(KEYRING_SERVICE, "genai_model", model)
+        deck.audit.write("study_deck_genai_key_saved", remembered=bool(data.get("remember")))
+        return JSONResponse({"genai": genai_status(user, request), "models": models})
+
+    async def genai_forget(request: Request) -> Response:
+        user = deck.user_for(request)
+        user.genai_key = user.genai_model = None
+        if deck.is_local(request):
+            kr = _keyring()
+            for name in ("genai_api_key", "genai_model"):
+                try:
+                    if kr is not None:
+                        kr.delete_password(KEYRING_SERVICE, name)
+                except Exception:
+                    pass
+        return JSONResponse({"genai": genai_status(user, request)})
 
     # ------------------------------------------------------------- Brightspace
 
@@ -326,7 +440,7 @@ def create_app(settings: StudyDeckSettings | None = None) -> Starlette:
             raise ApiError("Deck size must be a number.") from exc
         size = max(max(6, len(strata)), min(size, settings.max_deck_size))
         session = GameSession(code=deck.store.new_code(), host_id=user.id, strata=strata, types=types,
-                              deck_size=size, generator=deck.make_generator(data.get("genai_key")))
+                              deck_size=size, generator=deck.make_generator(data.get("genai_key"), user, request))
         session.players[user.id] = Player(user.id, user.name, is_host=True, verified_org_ids=user.verified)
         try:
             deck.store.add(session)
@@ -533,6 +647,9 @@ def create_app(settings: StudyDeckSettings | None = None) -> Starlette:
         Route("/auth/brightspace/start", api(connect_start)),
         Route("/auth/brightspace/callback", api(connect_callback)),
         Route("/api/me", api(me), methods=["GET", "POST"]),
+        Route("/api/settings/genai", api(genai_save), methods=["POST"]),
+        Route("/api/settings/genai/models", api(genai_models), methods=["POST"]),
+        Route("/api/settings/genai/forget", api(genai_forget), methods=["POST"]),
         Route("/api/brightspace/disconnect", api(disconnect), methods=["POST"]),
         Route("/api/courses", api(courses)),
         Route("/api/courses/{key}/modules", api(modules)),

@@ -20,6 +20,8 @@ body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--body);
   -webkit-font-smoothing:antialiased;min-height:100vh;display:flex;flex-direction:column}
 button,input,select,textarea{font:inherit;color:inherit}
 button{cursor:pointer}
+a{color:var(--ink);text-underline-offset:3px;text-decoration-thickness:1.5px}
+a:hover{text-decoration-color:var(--gold-ink)}
 :focus-visible{outline:2px solid var(--ink);outline-offset:2px}
 .skip{position:absolute;left:-999px;top:8px;background:var(--ink);color:#fff;padding:8px 14px;border-radius:10px;z-index:50}
 .skip:focus{left:12px}
@@ -88,6 +90,9 @@ h3{font-size:1rem;font-weight:800;letter-spacing:-.01em}
 .pill{display:inline-flex;align-items:center;gap:6px;min-height:30px;padding:0 12px;border-radius:999px;background:var(--paper);
   border:1px solid var(--line);font-size:.8rem;font-weight:600;white-space:nowrap}
 .pill.gold{background:var(--gold);border-color:transparent}
+.pill-link{color:var(--ink);text-decoration:none}
+.pill-link:hover{border-color:var(--ink)}
+.row.grow-first{align-items:flex-end}
 .pill.ink{background:var(--ink);color:#fff;border-color:transparent}
 .dot{width:9px;height:9px;border-radius:50%;background:var(--muted);flex:0 0 auto}
 .dot.on{background:var(--ok)}

@@ -100,6 +100,41 @@ class GenAIStudio:
         await self.http.aclose()
 
 
+def models_url(chat_url: str) -> str:
+    """GenAI Studio lists models at /api/models next to /api/chat/completions."""
+    base = check_genai_url(chat_url)
+    if base.endswith("/chat/completions"):
+        return base[: -len("/chat/completions")] + "/models"
+    return base.rstrip("/") + "/models"
+
+
+async def list_models(chat_url: str, api_key: str, http: httpx.AsyncClient | None = None) -> list[str]:
+    """Check a GenAI Studio key and return the model IDs it can use."""
+    client = http or httpx.AsyncClient(timeout=20.0)
+    try:
+        resp = await client.get(models_url(chat_url), headers={"Authorization": f"Bearer {api_key}"})
+    except httpx.HTTPError as exc:
+        raise GenerationError(
+            "Couldn't reach Purdue GenAI Studio. If you're off campus, try Purdue's VPN."
+        ) from exc
+    finally:
+        if http is None:
+            await client.aclose()
+    if resp.status_code in (401, 403):
+        raise GenerationError("Purdue GenAI Studio didn't accept that API key.")
+    if resp.status_code >= 400:
+        raise GenerationError(f"Purdue GenAI Studio returned HTTP {resp.status_code} when listing models.")
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        raise GenerationError("Purdue GenAI Studio returned an unexpected response.") from exc
+    items = data.get("data", []) if isinstance(data, dict) else data
+    ids = sorted({str(m.get("id")) for m in items if isinstance(m, dict) and m.get("id")})
+    if not ids:
+        raise GenerationError("That key works, but no models are available to it.")
+    return ids
+
+
 def parse_json_block(text: str) -> list[Any]:
     """Pull the question list out of a model reply, tolerating code fences and chatter."""
     fenced = re.search(r"```(?:json)?\s*(.+?)```", text, re.DOTALL)

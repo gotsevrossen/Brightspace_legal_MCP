@@ -225,6 +225,107 @@ async def test_security_headers(app):
     assert r.headers["x-content-type-options"] == "nosniff"
 
 
+class FakeKeyring:
+    def __init__(self):
+        self.store = {}
+
+    def get_password(self, service, name):
+        return self.store.get((service, name))
+
+    def set_password(self, service, name, value):
+        self.store[(service, name)] = value
+
+    def delete_password(self, service, name):
+        self.store.pop((service, name), None)
+
+
+@pytest.fixture
+def fake_genai(monkeypatch):
+    import study_deck.app as app_mod
+    import study_deck.genai as genai_mod
+
+    async def fake_list_models(url, key, http=None):
+        if key != "GOOD-KEY-1234":
+            raise genai_mod.GenerationError("Purdue GenAI Studio didn't accept that API key.")
+        return ["gemma3:12b", "llama3.1:latest"]
+
+    ring = FakeKeyring()
+    monkeypatch.setattr(genai_mod, "list_models", fake_list_models)
+    monkeypatch.setattr(app_mod, "_keyring", lambda: ring)
+    return ring
+
+
+async def test_settings_save_key_and_use_it_for_games(app, fake_genai):
+    c = client(app)
+    me = (await c.get("/api/me")).json()
+    assert me["genai"]["configured"] is False and me["genai"]["offline_demo"] is True
+
+    bad = await c.post("/api/settings/genai", json={"key": "nope-nope-nope", "model": ""})
+    assert bad.status_code == 400 and "didn't accept" in bad.json()["error"]
+
+    models = await c.post("/api/settings/genai/models", json={"key": "GOOD-KEY-1234"})
+    assert models.json()["models"] == ["gemma3:12b", "llama3.1:latest"]
+
+    r = await c.post("/api/settings/genai", json={"key": "GOOD-KEY-1234", "model": "gemma3:12b"})
+    assert r.status_code == 200
+    g = r.json()["genai"]
+    assert g["configured"] and g["model"] == "gemma3:12b" and g["source"] == "yours" and g["key_hint"] == "…1234"
+    # The key itself never comes back to the browser.
+    assert "GOOD-KEY-1234" not in r.text and "GOOD-KEY-1234" not in (await c.get("/api/me")).text
+    assert fake_genai.store == {}  # not remembered unless asked
+
+    keys = await connect_demo(c)
+    code = (await c.post("/api/sessions", json={
+        "name": "Hana", "strata": [{"course": keys["BIOL"], "kind": "course"}], "types": ["mcq"],
+        "deck_size": 6, "ai_permission_courses": [keys["BIOL"]],
+    })).json()["code"]
+    gen = app.state.deck.store.sessions[code].generator
+    assert gen.name == "Purdue GenAI Studio" and gen.model == "gemma3:12b" and gen.api_key == "GOOD-KEY-1234"
+
+    assert (await c.post("/api/settings/genai", json={"model": "not-a-model"})).status_code == 400
+
+    forgot = (await c.post("/api/settings/genai/forget")).json()["genai"]
+    assert forgot["configured"] is False
+
+
+async def test_settings_remember_uses_keychain_locally_only(app, fake_genai):
+    c = client(app)  # httpx's ASGI transport connects from 127.0.0.1
+    r = await c.post("/api/settings/genai", json={"key": "GOOD-KEY-1234", "model": "llama3.1:latest", "remember": True})
+    assert r.status_code == 200 and fake_genai.store[("study-deck", "genai_api_key")] == "GOOD-KEY-1234"
+
+    # A new browser on this computer picks up the remembered key.
+    other = client(app)
+    g = (await other.get("/api/me")).json()["genai"]
+    assert g["configured"] and g["source"] == "saved" and g["model"] == "llama3.1:latest"
+
+    # Someone connecting from another machine never gets it.
+    remote = httpx.AsyncClient(transport=httpx.ASGITransport(app=app, client=("192.168.1.20", 5000)),
+                               base_url="http://test", headers=H)
+    g = (await remote.get("/api/me")).json()["genai"]
+    assert g["configured"] is False and g["can_remember"] is False
+    r = await remote.post("/api/settings/genai", json={"key": "GOOD-KEY-1234", "remember": True})
+    assert r.status_code == 400
+
+    await c.post("/api/settings/genai/forget")
+    assert fake_genai.store == {}
+
+
+async def test_list_models_parses_genai_studio_reply():
+    from study_deck.genai import GenerationError, list_models, models_url
+
+    assert models_url("https://genai.rcac.purdue.edu/api/chat/completions") == "https://genai.rcac.purdue.edu/api/models"
+
+    def handler(request):
+        if request.headers["authorization"] != "Bearer K":
+            return httpx.Response(401)
+        return httpx.Response(200, json={"data": [{"id": "llama3.1:latest"}, {"id": "gemma3:12b"}]})
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    assert await list_models("https://genai.rcac.purdue.edu/api/chat/completions", "K", http) == ["gemma3:12b", "llama3.1:latest"]
+    with pytest.raises(GenerationError):
+        await list_models("https://genai.rcac.purdue.edu/api/chat/completions", "bad", http)
+
+
 async def test_connect_returns_only_to_game_pages(app):
     c = client(app)
     r = await c.get("/auth/brightspace/start", params={"next": "/#/game/ABC234"})

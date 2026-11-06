@@ -40,7 +40,11 @@ pip install -e ".[web]"
 study-deck
 ```
 
-Then open <http://127.0.0.1:8000>. Without further settings it runs in **demo mode**: two
+Then open <http://127.0.0.1:8000>. To write real questions, open **Settings** (top right),
+paste your Purdue GenAI Studio API key, press **Check key**, pick a model and **Save**. When the
+app runs on your own computer you can tick **Remember on this computer**: the key is then kept
+in your system keychain (macOS Keychain, Windows Credential Manager), never in a file, and is
+only used for requests from that computer. Without further settings it runs in **demo mode**: two
 sample courses and a simple offline question writer, so the whole game can be tried with no
 Purdue access. Pasting a GenAI Studio API key when creating a game switches that game to
 Purdue GenAI Studio.
