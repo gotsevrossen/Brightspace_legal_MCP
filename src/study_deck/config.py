@@ -15,6 +15,9 @@ PREFIX = "STUDY_DECK_"
 # data excluding FERPA. Course materials are Sensitive, not FERPA records.
 DEFAULT_GENAI_URL = "https://genai.rcac.purdue.edu/api/chat/completions"
 
+# Upper bound for STUDY_DECK_MAX_DECK_SIZE (each 8 cards is one GenAI Studio request).
+MAX_DECK_SIZE_CAP = 300
+
 # The MCP server's read-only scopes, plus reading course content files.
 STUDY_SCOPES = tuple(sorted(set(DEFAULT_OAUTH_SCOPES) | {"content:file:read"}))
 
@@ -44,6 +47,9 @@ class StudyDeckSettings:
     public_url: str = "http://127.0.0.1:8000"
     session_secret: str = field(default_factory=lambda: secrets.token_urlsafe(32))
     demo_mode: bool = True
+    # Personal sign-in: the person running the app on this computer signs in to
+    # Brightspace in a browser window and the app uses that session (opt-in).
+    browser_mode: bool = False
 
     genai_url: str = DEFAULT_GENAI_URL
     genai_model: str = "llama3.1:latest"
@@ -56,7 +62,7 @@ class StudyDeckSettings:
     session_ttl_minutes: int = 240
     max_players: int = 8
     max_sessions: int = 200
-    max_deck_size: int = 60
+    max_deck_size: int = 100
     max_upload_bytes: int = 15 * 1024 * 1024
     max_files_per_player: int = 20
     max_course_files: int = 30
@@ -71,12 +77,20 @@ class StudyDeckSettings:
     def from_env(cls) -> "StudyDeckSettings":
         client_id = _env("OAUTH_CLIENT_ID")
         scopes = _env("OAUTH_SCOPES")
+        public_url = (_env("PUBLIC_URL", "http://127.0.0.1:8000") or "").rstrip("/")
+        # Uses your own signed-in session for automated read-only requests, which
+        # Purdue has not explicitly authorized, so it must be acknowledged.
+        browser_mode = client_id is None and _bool("BROWSER_MODE_ACKNOWLEDGED", False)
+        if browser_mode and (urlsplit(public_url).hostname or "") not in {"127.0.0.1", "localhost", "::1"}:
+            raise ValueError(f"{PREFIX}BROWSER_MODE_ACKNOWLEDGED only works when the app runs on your own "
+                             f"computer ({PREFIX}PUBLIC_URL on 127.0.0.1 or localhost).")
         return cls(
-            public_url=(_env("PUBLIC_URL", "http://127.0.0.1:8000") or "").rstrip("/"),
+            public_url=public_url,
             session_secret=_env("SESSION_SECRET") or secrets.token_urlsafe(32),
-            # Without a Purdue-issued Brightspace OAuth client the app runs on
-            # sample courses only. It never falls back to scraping or passwords.
-            demo_mode=_bool("DEMO", client_id is None),
+            # Without a Purdue-issued Brightspace OAuth client (or personal sign-in)
+            # the app runs on sample courses only. It never uses passwords or scraping.
+            demo_mode=_bool("DEMO", client_id is None and not browser_mode),
+            browser_mode=browser_mode,
             genai_url=check_genai_url(_env("GENAI_URL", DEFAULT_GENAI_URL) or DEFAULT_GENAI_URL),
             genai_model=_env("GENAI_MODEL", "llama3.1:latest") or "llama3.1:latest",
             genai_api_key=_env("GENAI_API_KEY"),
@@ -85,5 +99,7 @@ class StudyDeckSettings:
             oauth_scopes=tuple(scopes.split()) if scopes else STUDY_SCOPES,
             session_ttl_minutes=int(_env("SESSION_TTL_MINUTES", "240") or 240),
             max_players=int(_env("MAX_PLAYERS", "8") or 8),
+            # Every 8 cards is one GenAI Studio request, so keep this modest.
+            max_deck_size=max(1, min(MAX_DECK_SIZE_CAP, int(_env("MAX_DECK_SIZE", "100") or 100))),
             brightspace=Settings(),
         )

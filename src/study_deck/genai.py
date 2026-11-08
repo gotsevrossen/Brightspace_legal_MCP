@@ -96,6 +96,30 @@ class GenAIStudio:
             raise GenerationError("Purdue GenAI Studio returned an unexpected response.") from exc
         return validate_questions(parse_json_block(content), set(types), avoid)
 
+    async def choose_files(self, course: str, outline: str, sections: list[str], limit: int) -> str:
+        """Pick folders and files from an outline of TITLES only. Returns the raw reply."""
+        from .picker import PICK_PROMPT  # noqa: PLC0415
+
+        studying = "\n".join(f"- {s}" for s in sections)
+        user = (f"Course: {course}\nThe student is studying:\n{studying}\n"
+                f"Choose at most {limit} files in total.\n\nOutline:\n{outline}")
+        body = {
+            "model": self.model,
+            "messages": [{"role": "system", "content": PICK_PROMPT}, {"role": "user", "content": user}],
+            "temperature": 0.1,
+            "stream": False,
+        }
+        try:
+            resp = await self.http.post(self.url, json=body, headers={"Authorization": f"Bearer {self.api_key}"})
+        except httpx.HTTPError as exc:
+            raise GenerationError("Could not reach Purdue GenAI Studio.") from exc
+        if resp.status_code >= 400:
+            raise GenerationError(f"Purdue GenAI Studio returned HTTP {resp.status_code}.")
+        try:
+            return str(resp.json()["choices"][0]["message"]["content"])
+        except (KeyError, IndexError, ValueError) as exc:
+            raise GenerationError("Purdue GenAI Studio returned an unexpected response.") from exc
+
     async def close(self) -> None:
         await self.http.aclose()
 

@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import json
+from base64 import b64decode
 import hashlib
 import hmac
 import logging
@@ -26,8 +30,10 @@ from starlette.staticfiles import StaticFiles
 from purdue_brightspace_mcp.client import AuthRequired, BrightspaceHTTPError
 from purdue_brightspace_mcp.policy import AuditLog, PolicyViolation
 
-from .brightspace import Course, DemoSource, LiveSource, Source, TokenTransport, WebOAuth, pkce_pair
+from .brightspace import (BrowserTransport, Course, DemoSource, LiveSource, Source, TokenTransport, WebOAuth,
+                          pkce_pair)
 from .config import StudyDeckSettings
+from .picker import pick_files
 from .extract import UnsupportedFile, extract_text
 from .game import GameSession, Player, SessionStore, Stratum, make_chunks, spawn
 from . import genai as genai_mod
@@ -64,6 +70,8 @@ class User:
     source: Source | None = None
     courses: dict[int, Course] = field(default_factory=dict)
     pending: tuple[str, str] | None = None  # OAuth state, PKCE verifier
+    signing_in: bool = False  # personal sign-in tab is open
+    signin_error: str | None = None
     next_url: str = "/#connected"
     genai_key: str | None = None  # entered on the Settings page; memory only
     genai_model: str | None = None
@@ -85,6 +93,75 @@ class StudyDeck:
         self.audit = AuditLog(settings.brightspace.state_dir / "study-deck-audit.jsonl",
                               settings.brightspace.audit_log_enabled)
         self.oauth = WebOAuth(settings) if settings.oauth_client_id and not settings.demo_mode else None
+        self._tasks: set[asyncio.Task] = set()
+        # Personal sign-in: the one browser window Study Deck runs in on this computer.
+        self.window: BrowserTransport | None = None
+        # One-time links that open Study Deck in that window as the same player.
+        self.handoffs: dict[str, tuple[str, float]] = {}
+
+    def app_window(self) -> BrowserTransport:
+        if self.window is None:
+            self.window = BrowserTransport(self.settings.brightspace.base_url, self.settings.public_url)
+        return self.window
+
+    async def open_window(self) -> None:
+        """Open Study Deck in its own browser window (personal sign-in mode, at startup)."""
+        try:
+            await self.app_window().show_app()
+        except Exception as exc:
+            log.warning("Couldn't open the Study Deck window (%s). Open %s in a browser instead.",
+                        exc, self.settings.public_url)
+
+    async def close_window(self) -> None:
+        if self.window is not None:
+            await self.window.shutdown()
+            self.window = None
+
+    def uid_from_cookie(self, value: str | None) -> str | None:
+        """Which player a Study Deck session cookie belongs to."""
+        if not value:
+            return None
+        import itsdangerous  # noqa: PLC0415
+
+        try:
+            data = itsdangerous.TimestampSigner(str(self.settings.session_secret)).unsign(
+                value.encode(), max_age=self.settings.session_ttl_minutes * 60)
+            return json.loads(b64decode(data)).get("uid")
+        except Exception:
+            return None
+
+    async def _show_in_window(self, user: User, window: BrowserTransport) -> None:
+        """Make sure the window shows Study Deck as this player, so the sign-in tab
+        opens next to the game and closing it lands back on the game."""
+        if window.app_pages() and self.uid_from_cookie(await window.app_cookie("study_deck")) == user.id:
+            return
+        now = time.time()
+        self.handoffs = {t: v for t, v in self.handoffs.items() if v[1] > now}
+        token = secrets.token_urlsafe(24)
+        self.handoffs[token] = (user.id, now + 120)
+        await window.show_app(f"{window.app_url}/auth/window?t={token}")
+
+    async def personal_sign_in(self, user: User) -> None:
+        """Personal sign-in: open Purdue's page as a new tab in the Study Deck window and wait."""
+        transport = self.app_window()
+        try:
+            await transport.open()
+            await self._show_in_window(user, transport)
+            await transport.sign_in()
+            source = LiveSource(self.settings, transport, self.audit)
+            source.kind = "personal"
+            user.source = source
+            await self.load_courses(user)
+            self.audit.write("study_deck_personal_sign_in", courses=len(user.courses))
+        except (AuthRequired, BrightspaceHTTPError, PolicyViolation) as exc:
+            user.source, user.courses = None, {}
+            user.signin_error = str(exc)
+        except Exception:
+            log.exception("personal sign-in failed")
+            user.source, user.courses = None, {}
+            user.signin_error = "Brightspace sign-in failed. Try again."
+        finally:
+            user.signing_in = False
 
     # ---------------------------------------------------------------- helpers
 
@@ -214,6 +291,7 @@ class StudyDeck:
                 for p in session.players.values()
             ],
             "held_back": session.held_back(),
+            "picked": list(session.picked.values()),
             "has_brightspace": bool(orgs),
             "deck": {"total": len(session.deck), "remaining": session.remaining(), "refilling": session.refilling},
             "card": card,
@@ -229,7 +307,7 @@ def _clean_name(value: Any) -> str:
     return name
 
 
-def create_app(settings: StudyDeckSettings | None = None) -> Starlette:
+def create_app(settings: StudyDeckSettings | None = None, *, open_window: bool = False) -> Starlette:
     settings = settings or StudyDeckSettings.from_env()
     deck = StudyDeck(settings)
 
@@ -254,9 +332,13 @@ def create_app(settings: StudyDeckSettings | None = None) -> Starlette:
         return JSONResponse({
             "name": user.name,
             "demo_mode": settings.demo_mode,
+            "personal_mode": settings.browser_mode,
+            "max_deck_size": settings.max_deck_size,
             "brightspace": {"connected": user.source is not None,
                             "mode": user.source.kind if user.source else None,
-                            "courses": len(user.courses)},
+                            "courses": len(user.courses),
+                            "signing_in": user.signing_in,
+                            "error": user.signin_error},
             "genai": genai_status(user, request),
         })
 
@@ -338,6 +420,20 @@ def create_app(settings: StudyDeckSettings | None = None) -> Starlette:
             user.source = DemoSource()
             await deck.load_courses(user)
             return RedirectResponse(user.next_url, 303)
+        if settings.browser_mode:
+            # Personal sign-in uses this computer's browser, so only the person at this computer can connect.
+            if not deck.is_local(request):
+                return RedirectResponse("/#signin-local-only", 303)
+            if not user.signing_in:
+                if user.source is not None:
+                    await user.source.close()
+                user.source, user.courses = None, {}
+                user.signing_in, user.signin_error = True, None
+                deck.audit.write("study_deck_sign_in_start", mode="personal")
+                task = asyncio.create_task(deck.personal_sign_in(user))
+                deck._tasks.add(task)
+                task.add_done_callback(deck._tasks.discard)
+            return RedirectResponse(user.next_url if user.next_url.startswith("/#/game/") else "/#/", 303)
         if deck.oauth is None:
             raise ApiError("Brightspace sign-in isn't configured on this server.", 503)
         state = secrets.token_urlsafe(24)
@@ -345,6 +441,16 @@ def create_app(settings: StudyDeckSettings | None = None) -> Starlette:
         user.pending = (state, verifier)
         deck.audit.write("study_deck_sign_in_start")
         return RedirectResponse(deck.oauth.authorize_url(state, challenge), 303)
+
+    async def window_handoff(request: Request) -> Response:
+        """One-time link the app opens in its own window, so Study Deck there is the
+        same player who clicked Connect Brightspace in another browser."""
+        uid, expires = deck.handoffs.pop(request.query_params.get("t", ""), (None, 0.0))
+        if not deck.is_local(request) or uid not in deck.users or expires < time.time():
+            return RedirectResponse("/#/", 303)
+        request.session["uid"] = uid
+        user = deck.user_for(request)
+        return RedirectResponse(user.next_url if user.next_url.startswith("/#/game/") else "/#/", 303)
 
     async def connect_callback(request: Request) -> Response:
         user = deck.user_for(request)
@@ -384,7 +490,10 @@ def create_app(settings: StudyDeckSettings | None = None) -> Starlette:
             raise ApiError("Connect Brightspace first.", 403)
         org = deck.org_for_key(user, request.path_params["key"])
         mods = await user.source.modules(org)
-        return JSONResponse({"modules": [{"id": str(m.id), "title": m.title, "files": m.file_count} for m in mods]})
+        return JSONResponse({"modules": [
+            {"id": str(m.id), "title": m.title, "label": m.label, "files": m.file_count, "depth": m.depth,
+             "parent": str(m.parent) if m.parent is not None else None}
+            for m in mods]})
 
     # ---------------------------------------------------------------- sessions
 
@@ -419,7 +528,7 @@ def create_app(settings: StudyDeckSettings | None = None) -> Starlette:
             if kind == "module":
                 assert org is not None and user.source is not None
                 if org not in module_cache:
-                    module_cache[org] = {m.id: m.title for m in await user.source.modules(org)}
+                    module_cache[org] = {m.id: m.label for m in await user.source.modules(org)}
                 ids = [int(i) for i in raw.get("modules") or [] if str(i).isdigit()]
                 ids = [i for i in ids if i in module_cache[org]]
                 if not ids:
@@ -435,10 +544,14 @@ def create_app(settings: StudyDeckSettings | None = None) -> Starlette:
         if not types:
             raise ApiError("Choose multiple choice, fill in the blank, or both.")
         try:
-            size = int(data.get("deck_size") or 20)
+            raw_size = data.get("deck_size")
+            size = 20 if raw_size is None or raw_size == "" else int(raw_size)
         except (TypeError, ValueError) as exc:
             raise ApiError("Deck size must be a number.") from exc
-        size = max(max(6, len(strata)), min(size, settings.max_deck_size))
+        smallest = len(strata)  # at least one card per section
+        if not smallest <= size <= settings.max_deck_size:
+            raise ApiError(f"Choose a deck of {smallest} to {settings.max_deck_size} cards"
+                           f"{' (at least one per section)' if smallest > 1 else ''}.")
         session = GameSession(code=deck.store.new_code(), host_id=user.id, strata=strata, types=types,
                               deck_size=size, generator=deck.make_generator(data.get("genai_key"), user, request))
         session.players[user.id] = Player(user.id, user.name, is_host=True, verified_org_ids=user.verified)
@@ -543,13 +656,30 @@ def create_app(settings: StudyDeckSettings | None = None) -> Starlette:
                     source = deck.users[suppliers[0].id].source
                     assert source is not None
                     strata = [s for s in session.strata if s.org_id == org]
+                    course = session.course_orgs()[org]
                     whole = any(s.kind != "module" for s in strata)
                     module_ids = None if whole else sorted({m for s in strata for m in s.module_ids})
-                    session.progress = f"Reading {session.course_orgs()[org]} from Brightspace…"
-                    pieces = await source.material(org, module_ids)
+                    session.progress = f"Looking through {course}'s folders…"
+                    scope = await source.files(org, module_ids)
+                    # Typed topics narrow the files, unless a section wants the whole course.
+                    topics = [] if any(s.kind == "course" for s in strata) else [
+                        s.topic for s in strata if s.kind == "topic" and s.topic]
+                    sections = [s.topic if s.kind == "topic" else
+                                " / ".join(s.module_labels) if s.kind == "module" else "the whole course"
+                                for s in strata]
+                    if len(scope) > settings.max_course_files or topics:
+                        session.progress = f"Choosing which {course} files to read…"
+                    pick = await pick_files(session.generator, course, scope, [x for x in sections if x],
+                                            topics, settings.max_course_files)
+                    session.picked[org] = {"course": course, "how": pick.how, "of": len(scope),
+                                           "folders": pick.folders, "files": [f.label for f in pick.files]}
+                    deck.audit.write("study_deck_files_picked", how=pick.how, files=len(pick.files), of=len(scope))
+                    session.progress = f"Reading {len(pick.files)} file{'' if len(pick.files) == 1 else 's'} from {course}…"
+                    pieces = await source.read(org, pick.files)
                     for piece in pieces:
                         session.add_chunks(make_chunks(piece.text, source="brightspace", contributor=suppliers[0].id,
-                                                       org_id=org, module_id=piece.module_id))
+                                                       org_id=org, module_id=piece.module_id,
+                                                       module_path=piece.module_path))
                     session.brightspace_loaded.add(org)
                 added = await session.generate(session.deck_size)
                 if not added:
@@ -574,6 +704,8 @@ def create_app(settings: StudyDeckSettings | None = None) -> Starlette:
         session = deck.session_for(request.path_params["code"], user, host=True)
         if session.status != "ready":
             raise ApiError("Build the deck first.", 409)
+        if session.current is not None and user.id not in session.answers:
+            raise ApiError("Answer this card before drawing the next one.", 409)
         if session.draw() is None:
             session.current = None
             if not session.refilling:
@@ -587,7 +719,7 @@ def create_app(settings: StudyDeckSettings | None = None) -> Starlette:
         session = deck.session_for(request.path_params["code"], user)
         data = await body(request)
         try:
-            session.submit(user.id, str(data.get("question_id")), data.get("answer"))
+            session.submit(user.id, str(data.get("question_id")), data.get("answer"), skipped=data.get("skip") is True)
         except ValueError as exc:
             raise ApiError(str(exc), 409) from exc
         return JSONResponse(deck.view(session, user))
@@ -646,6 +778,7 @@ def create_app(settings: StudyDeckSettings | None = None) -> Starlette:
         Route("/", index),
         Route("/auth/brightspace/start", api(connect_start)),
         Route("/auth/brightspace/callback", api(connect_callback)),
+        Route("/auth/window", api(window_handoff)),
         Route("/api/me", api(me), methods=["GET", "POST"]),
         Route("/api/settings/genai", api(genai_save), methods=["POST"]),
         Route("/api/settings/genai/models", api(genai_models), methods=["POST"]),
@@ -667,8 +800,18 @@ def create_app(settings: StudyDeckSettings | None = None) -> Starlette:
     ]
     from starlette.middleware.base import BaseHTTPMiddleware  # noqa: PLC0415
 
+    @contextlib.asynccontextmanager
+    async def lifespan(app: Starlette):
+        if open_window and settings.browser_mode:
+            task = asyncio.create_task(deck.open_window())
+            deck._tasks.add(task)
+            task.add_done_callback(deck._tasks.discard)
+        yield
+        await deck.close_window()
+
     app = Starlette(
         routes=routes,
+        lifespan=lifespan,
         middleware=[
             Middleware(SessionMiddleware, secret_key=settings.session_secret, session_cookie="study_deck",
                        max_age=settings.session_ttl_minutes * 60, same_site="lax",
@@ -685,11 +828,14 @@ def main() -> None:
 
     logging.basicConfig(level=logging.INFO, stream=sys.stderr)
     settings = StudyDeckSettings.from_env()
+    if settings.browser_mode:
+        log.warning("Personal sign-in mode: Brightspace uses your own session on this computer "
+                    "(STUDY_DECK_BROWSER_MODE_ACKNOWLEDGED). Other players can't connect Brightspace.")
     if settings.demo_mode:
         log.warning("Demo mode: sample courses only%s.",
                     "" if settings.genai_api_key else ", offline question generator")
     host = "127.0.0.1"
-    uvicorn.run(create_app(settings), host=host, port=int(__import__("os").environ.get("PORT", "8000")))
+    uvicorn.run(create_app(settings, open_window=settings.browser_mode), host=host, port=int(__import__("os").environ.get("PORT", "8000")))
 
 
 if __name__ == "__main__":

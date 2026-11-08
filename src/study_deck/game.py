@@ -27,6 +27,10 @@ from .genai import BLANK, GenerationError, Generator
 CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 MATERIAL_CHARS_PER_CALL = 6000
 BATCH_SIZE = 8
+# Write new cards in the background when this many are left in the deck...
+REFILL_AT = 5
+# ...and this many at a time.
+REFILL_CARDS = 10
 TOPIC_CHUNKS = 12
 
 
@@ -58,6 +62,7 @@ class Chunk:
     org_id: int | None = None
     module_id: int | None = None
     stratum_id: str | None = None
+    module_path: tuple[int, ...] = ()  # every folder it sits in, top level first
 
     @property
     def digest(self) -> str:
@@ -124,6 +129,8 @@ class GameSession:
     used_prompts: list[str] = field(default_factory=list)
     stratum_cursor: dict[str, int] = field(default_factory=dict)
     brightspace_loaded: set[int] = field(default_factory=set)
+    # Which Brightspace files each course's material came from, and how they were chosen.
+    picked: dict[int, dict[str, Any]] = field(default_factory=dict)
     rng: random.Random = field(default_factory=random.Random)
     created: float = field(default_factory=time.time)
     last_active: float = field(default_factory=time.time)
@@ -173,7 +180,8 @@ class GameSession:
             if c.source == "brightspace" and c.org_id == stratum.org_id and c.org_id in shareable
         ]
         if stratum.kind == "module":
-            brightspace = [c for c in brightspace if c.module_id in stratum.module_ids]
+            brightspace = [c for c in brightspace
+                           if any(m in stratum.module_ids for m in (c.module_path or (c.module_id,)))]
         uploads = [c for c in self.chunks if c.source != "brightspace" and c.stratum_id == stratum.id]
         pool = brightspace + uploads
         if stratum.kind == "topic" and stratum.topic:
@@ -210,10 +218,14 @@ class GameSession:
         return len(self.deck) - self.cursor
 
     async def generate(self, total: int) -> int:
-        """Generate `total` cards split evenly across strata that have material, interleaved."""
+        """Generate `total` cards split evenly across strata that have material, then add
+        them to the deck in random order."""
         active = [s for s in self.strata if self.material_for(s)]
         if not active:
             raise GenerationError("No study material yet. Add notes or files, or connect Brightspace.")
+        # When cards don't divide evenly, a different section gets the extra ones each time.
+        turn = len(self.deck) % len(active)
+        active = active[turn:] + active[:turn]
         share, extra = divmod(total, len(active))
         per_stratum: dict[str, list[Question]] = {}
         for n, stratum in enumerate(active):
@@ -238,18 +250,17 @@ class GameSession:
                     got.append(question)
                     self.used_prompts.append(q["prompt"])
             per_stratum[stratum.id] = got[:want]
-        # Stratify: deal one card from each section in turn.
-        added = 0
-        queues = [per_stratum[s.id] for s in active]
-        while any(queues):
-            for queue in queues:
-                if queue:
-                    self.deck.append(queue.pop(0))
-                    added += 1
-        return added
+        # Every section gets its fair share of each batch (stratified), and the batch is
+        # shuffled so the order of sections and questions is random while studying.
+        batch = [q for s in active for q in per_stratum[s.id]]
+        self.rng.shuffle(batch)
+        self.deck.extend(batch)
+        return len(batch)
 
     def refill_threshold(self) -> int:
-        return max(2, self.deck_size // 4)
+        # New cards are written when 5 are left (fewer for tiny decks, so they
+        # don't top up before they're even played).
+        return min(REFILL_AT, self.deck_size - 1)
 
     def wants_refill(self) -> bool:
         return self.status == "ready" and not self.refilling and self.remaining() <= self.refill_threshold()
@@ -259,7 +270,7 @@ class GameSession:
             return
         self.refilling = True
         try:
-            added = await self.generate(max(len(self.strata) * 2, self.deck_size // 2))
+            added = await self.generate(REFILL_CARDS)
             if not added:
                 self.notices.append("Couldn't write new cards from the remaining material.")
         except GenerationError as exc:
@@ -279,18 +290,24 @@ class GameSession:
         self.answers = {}
         return self.current
 
-    def submit(self, player_id: str, question_id: str, given: Any) -> dict[str, Any]:
+    def submit(self, player_id: str, question_id: str, given: Any, skipped: bool = False) -> dict[str, Any]:
+        """Record a player's answer. skipped=True is "I don't know": it counts as a miss."""
         q = self.current
         if q is None or q.id != question_id:
             raise ValueError("That card is no longer in play.")
         if player_id in self.answers:
             raise ValueError("You already answered this card.")
-        correct = check_answer(q, given)
+        correct = False if skipped else check_answer(q, given)
         player = self.players[player_id]
         player.answered += 1
         player.score += int(correct)
-        shown = q.options[int(given)] if q.type == "mcq" and str(given).isdigit() and int(given) < len(q.options) else str(given)
-        self.answers[player_id] = {"correct": correct, "given": shown[:80]}
+        if skipped:
+            shown = ""
+        elif q.type == "mcq" and str(given).isdigit() and int(given) < len(q.options):
+            shown = q.options[int(given)]
+        else:
+            shown = str(given)
+        self.answers[player_id] = {"correct": correct, "given": shown[:80], "skipped": skipped}
         return {"correct": correct, "expected": q.expected, "explanation": q.explanation}
 
 

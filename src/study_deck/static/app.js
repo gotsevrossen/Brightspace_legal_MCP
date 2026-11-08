@@ -10,6 +10,8 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
 const ICON = {
+  plus: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>',
+  chev: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>',
   check: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg>',
   up: '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5M5.5 11.5 12 5l6.5 6.5"/></svg>',
   alert: '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>',
@@ -95,39 +97,61 @@ async function route() {
   const hash = location.hash || "#/";
   if (hash === "#connected") { history.replaceState(null, "", "#/"); toast("Brightspace connected."); }
   if (hash === "#signin-failed") { history.replaceState(null, "", "#/"); toast("Brightspace sign-in didn't finish. Try again.", true); }
+  if (hash === "#signin-local-only") { history.replaceState(null, "", "#/"); toast("Brightspace can only be connected on the computer running Study Deck.", true); }
   try {
     await loadMe();
+    watchSignIn();
     const parts = (location.hash || "#/").slice(2).split("/");
     if (parts[0] === "host") await hostView();
     else if (parts[0] === "settings") settingsView();
     else if (parts[0] === "game" && parts[1]) await gameView(parts[1].toUpperCase());
     else homeView(parts[0] === "join" ? (parts[1] || "") : "");
   } catch (e) {
-    main.innerHTML = `<section class="card"><h2>Something went wrong</h2><p class="muted">${esc(e.message)}</p><a class="btn dark" href="#/">Back to start</a></section>`;
+    main.innerHTML = `<section class="card"><h2>Something went wrong</h2><p class="muted">${esc(e.message)}</p><div class="btn-row"><a class="btn dark" href="#/">Back to start</a></div></section>`;
   }
   main.focus({ preventScroll: true });
 }
 window.addEventListener("hashchange", route);
 
+/* Personal sign-in happens in a browser window the app opens itself (automated, so
+   navigator.webdriver is true there). Your own browser tabs work too, once signed in. */
+const IN_APP_WINDOW = navigator.webdriver === true;
+
+/* Personal sign-in: a browser window on this computer is open on Purdue's page. */
+let signInTimer = null;
+function watchSignIn() {
+  if (!me.brightspace.signing_in || signInTimer) return;
+  toast(IN_APP_WINDOW ? "Finish signing in to Purdue in the new tab. It closes by itself when you're done."
+    : "Sign in to Purdue in the Study Deck window that opened (it may be behind this one). This page connects by itself.");
+  signInTimer = setInterval(async () => {
+    try { await loadMe(); } catch { return; }
+    if (me.brightspace.signing_in) return;
+    clearInterval(signInTimer); signInTimer = null;
+    try { window.focus(); } catch {}
+    if (me.brightspace.connected) toast(`Brightspace connected · ${me.brightspace.courses} courses.`);
+    else toast(me.brightspace.error || "Brightspace sign-in didn't finish. Try again.", true);
+    route();
+  }, 2000);
+}
+
 /* -------------------------------------------------------------------- home */
 
+/* Small Brightspace status bar on the home page; the details live in Settings. */
 function connectCard() {
   const bs = me.brightspace;
-  if (bs.connected) {
-    return `<section class="card">
-      <div class="card-head"><div><p class="eyebrow">Brightspace</p><h2>Connected</h2></div><span class="pill"><span class="dot on"></span>${esc(bs.courses)} courses</span></div>
-      <p class="muted small">${bs.mode === "demo" ? "Sample courses for trying the game. No real Brightspace data is used." : "Signed in through Purdue. Your session is held in memory only and ends when you disconnect or go idle."}</p>
-      <div><button class="btn line sm" id="disconnect" type="button">Disconnect</button></div>
-    </section>`;
-  }
-  return `<section class="card">
-    <p class="eyebrow">Brightspace</p><h2>Bring your courses</h2>
-    <p class="muted small">${me.demo_mode
-      ? "This server runs in demo mode: connecting loads two sample courses. Real Brightspace sign-in turns on once Purdue registers this app."
-      : "Sign in on Purdue's own page. This app never sees your password, and only reads course content from courses you pick."}</p>
-    <div><a class="btn dark" href="/auth/brightspace/start">${me.demo_mode ? "Load sample courses" : "Connect Brightspace"}</a></div>
-    <p class="hint">You can also play with your own notes and files only.</p>
+  const bar = (dot, title, sub, action) => `<section class="card tight bs-card">
+    <div class="bs-line"><span class="dot ${dot}" aria-hidden="true"></span>
+      <div class="bs-text"><b>${title}</b>${sub ? `<span class="hint">${sub}</span>` : ""}</div>${action}</div>
   </section>`;
+  if (bs.connected) {
+    return bar("on", "Brightspace connected", `${esc(bs.courses)} course${bs.courses === 1 ? "" : "s"}`,
+      '<button class="btn line sm" id="disconnect" type="button">Disconnect</button>');
+  }
+  if (bs.signing_in) {
+    return bar("wait", "Signing in to Brightspace…", IN_APP_WINDOW ? "Finish in the Purdue tab" : "Finish in the Study Deck window", "");
+  }
+  return bar("", "Brightspace not connected", "",
+    `<a class="btn dark sm" href="/auth/brightspace/start">${me.demo_mode ? "Load samples" : "Connect"}</a>`);
 }
 
 function homeView(prefill) {
@@ -139,11 +163,14 @@ function homeView(prefill) {
     </section>
     ${me.demo_mode ? `<div class="notice demo">${ICON.info}<p class="small"><b>Demo mode.</b> Sample courses${me.genai.offline_demo ? " and a simple offline card writer" : ""}. Real games use Purdue Brightspace and Purdue GenAI Studio once they're set up.</p></div>` : ""}
     <div class="grid g2">
-      <section class="card lead">
-        <p class="eyebrow">Host</p><h2>Start a game</h2>
-        <p class="muted">Choose courses, modules or topics, pick the question style, and share the join code with your table.</p>
-        <div><a class="btn dark big" href="#/host">Host a game</a></div>
-      </section>
+      <div class="grid">
+        <section class="card lead">
+          <p class="eyebrow">Host</p><h2>Start a game</h2>
+          <p class="muted">Choose courses, modules or topics, pick the question style, and share the join code with your table.</p>
+          <a class="btn dark big wide" href="#/host">Host a game</a>
+        </section>
+        ${connectCard()}
+      </div>
       <section class="card">
         <p class="eyebrow">Player</p><h2>Join a game</h2>
         <form id="joinForm" class="grid" novalidate>
@@ -152,8 +179,7 @@ function homeView(prefill) {
           <button class="btn gold wide" type="submit">Join</button>
         </form>
       </section>
-    </div>
-    ${connectCard()}`;
+    </div>`;
   $("#joinForm").addEventListener("submit", (e) => {
     e.preventDefault();
     const f = e.currentTarget;
@@ -270,7 +296,7 @@ async function hostView() {
       <h2><span class="step-num">2</span>Cards</h2>
       <div class="spread">
         <div class="grid"><b>Question style</b>${segHTML("types", [["mcq", "Multiple choice"], ["fill_blank", "Fill in the blank"], ["both", "Mix"]], setup.types, "Question style")}</div>
-        <div class="grid"><b>Starting deck</b><div class="stepper"><button type="button" data-step="-2" aria-label="Fewer cards">−</button><output id="sizeOut" aria-live="polite">${setup.size}</output><button type="button" data-step="2" aria-label="More cards">+</button></div></div>
+        <div class="grid"><label for="sizeIn"><b>Starting deck</b></label><div class="stepper"><button type="button" data-step="-1" aria-label="Fewer cards">−</button><input id="sizeIn" type="number" inputmode="numeric" min="1" max="${esc(me.max_deck_size)}" step="1" value="${esc(setup.size)}" aria-describedby="sizeHint"><button type="button" data-step="1" aria-label="More cards">+</button></div><span class="hint" id="sizeHint">Type any number of cards, 1 to ${esc(me.max_deck_size)}.</span></div>
       </div>
       <p class="hint">When the deck runs low, new questions are written automatically from the same sections.</p>
     </section>
@@ -301,10 +327,14 @@ async function hostView() {
     renderBlocks();
   });
   initSeg($('[data-seg="types"]'), (v) => { setup.types = v; });
-  $$(".stepper button").forEach((b) => b.addEventListener("click", () => {
-    setup.size = Math.max(6, Math.min(60, setup.size + Number(b.dataset.step)));
-    $("#sizeOut").textContent = setup.size;
-  }));
+  const sizeIn = $("#sizeIn");
+  const setSize = (n) => {
+    setup.size = Math.max(1, Math.min(me.max_deck_size, Math.round(Number(n)) || 1));
+    sizeIn.value = setup.size;
+  };
+  $$(".stepper button").forEach((b) => b.addEventListener("click", () => setSize(setup.size + Number(b.dataset.step))));
+  sizeIn.addEventListener("input", () => { const n = parseInt(sizeIn.value, 10); if (n >= 1 && n <= me.max_deck_size) setup.size = n; });
+  sizeIn.addEventListener("change", () => setSize(sizeIn.value));
   $("#createBtn").addEventListener("click", (e) => guarded(e.currentTarget, createGame));
   renderBlocks();
 }
@@ -337,24 +367,84 @@ async function renderBlocks() {
 async function renderKind(e, block) {
   const body = $(".kind-body", block);
   if (e.kind === "course") {
-    body.innerHTML = `<p class="muted small">${e.key ? "Every module's files, plus anything players add." : "Whatever notes and files players add for this course."}</p>`;
+    body.innerHTML = `<p class="muted small">${e.key ? "Files from every folder, at any depth, plus anything players add. If the course has more files than a deck reads at once, the AI picks a spread across its folders." : "Whatever notes and files players add for this course."}</p>`;
   } else if (e.kind === "topic") {
-    body.innerHTML = `<label class="f">Topics<input class="input" maxlength="200" placeholder="e.g. glycolysis, electron transport chain" value="${esc(e.topics)}"><span class="hint">Separate topics with commas. Each one becomes its own section of the deck.</span></label>`;
+    body.innerHTML = `<label class="f">Topics<input class="input" maxlength="200" placeholder="e.g. glycolysis, electron transport chain" value="${esc(e.topics)}"><span class="hint">Separate topics with commas. Each one becomes its own section of the deck.${e.key ? " The AI looks through every folder, however deep, and picks the files that match your topics. It only sees folder and file titles to do that." : ""}</span></label>`;
     $("input", body).addEventListener("input", (ev) => { e.topics = ev.target.value; });
   } else {
     body.innerHTML = '<p class="muted small">Loading modules…</p>';
     try {
       if (!e.modules) e.modules = (await api(`/api/courses/${encodeURIComponent(e.key)}/modules`)).modules;
-      body.innerHTML = e.modules.length
-        ? `<div class="chips">${e.modules.map((m) => `<button type="button" class="chip" data-mod="${esc(m.id)}" aria-pressed="${e.picked.has(m.id)}"><span class="tick">${ICON.check}</span>${esc(m.title)} <small>${m.files} file${m.files === 1 ? "" : "s"}</small></button>`).join("")}</div><p class="hint">Each module you pick becomes its own section of the deck.</p>`
-        : '<p class="muted small">This course has no modules with readable files. Try the whole course or a topic.</p>';
-      $$("[data-mod]", body).forEach((chip) => chip.addEventListener("click", () => {
-        const id = chip.dataset.mod;
-        if (e.picked.has(id)) e.picked.delete(id); else e.picked.add(id);
-        chip.setAttribute("aria-pressed", e.picked.has(id));
-      }));
+      renderTree(e, body);
     } catch (err) { body.innerHTML = `<p class="muted small">${esc(err.message)}</p>`; }
   }
+}
+
+/* Folder picker. A picked folder includes every folder inside it, so those show as
+   ticked ("included") and can't be picked separately, which would only repeat material. */
+function renderTree(e, body, focusSel) {
+  if (!e.modules.length) {
+    body.innerHTML = '<p class="muted small">This course has no folders with readable files. Try the whole course or a topic.</p>';
+    return;
+  }
+  const byId = new Map(e.modules.map((m) => [m.id, m]));
+  const kids = new Map();
+  e.modules.forEach((m) => {
+    const p = m.parent && byId.has(m.parent) ? m.parent : "";
+    if (!kids.has(p)) kids.set(p, []);
+    kids.get(p).push(m);
+  });
+  const nested = e.modules.some((m) => kids.has(m.id));
+  // Start with the top level open; in big courses deeper folders start folded.
+  if (!e.open) e.open = new Set(e.modules.filter((m) => kids.has(m.id) && (e.modules.length <= 20 || !m.parent)).map((m) => m.id));
+  const pickedAncestor = (m) => {
+    for (let p = byId.get(m.parent); p; p = byId.get(p.parent)) if (e.picked.has(p.id)) return p;
+    return null;
+  };
+  const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
+  const row = (m) => {
+    const children = kids.get(m.id) || [];
+    const open = e.open.has(m.id);
+    const state = e.picked.has(m.id) ? "on" : pickedAncestor(m) ? "included" : "off";
+    return `<li class="fnode">
+      <div class="frow" data-state="${state}">
+        ${children.length
+          ? `<button type="button" class="twist" data-twist="${esc(m.id)}" aria-expanded="${open}" aria-label="${open ? "Fold" : "Unfold"} ${esc(m.title)}">${ICON.chev}</button>`
+          : '<span class="twist-gap" aria-hidden="true"></span>'}
+        <button type="button" class="fpick" data-mod="${esc(m.id)}" aria-pressed="${state !== "off"}"${state === "included" ? ' aria-disabled="true"' : ""} title="${esc(m.label || m.title)}">
+          <span class="tick">${ICON.check}</span>
+          <span class="fname">${esc(m.title)}</span>
+          <span class="fmeta">${state === "included" ? "<b>Included</b> · " : ""}${plural(m.files, "file")}${children.length ? ` · ${plural(children.length, "folder")}` : ""}</span>
+        </button>
+      </div>
+      ${children.length ? `<ul class="fkids"${open ? "" : " hidden"}>${children.map(row).join("")}</ul>` : ""}
+    </li>`;
+  };
+  const n = e.picked.size;
+  body.innerHTML = `<ul class="ftree${nested ? "" : " flat"}" aria-label="Folders in ${esc(e.name)}">${(kids.get("") || []).map(row).join("")}</ul>
+    <p class="hint">${n ? `<b>${plural(n, "folder")} picked</b>, so ${plural(n, "section")} in the deck. ` : ""}${nested ? "Picking a folder includes every folder inside it; to choose inside it instead, unfold it and pick those. " : ""}If your picks hold more files than a deck reads at once, the AI chooses the most useful ones.</p>`;
+  $$("[data-twist]", body).forEach((b) => b.addEventListener("click", () => {
+    const id = b.dataset.twist;
+    if (e.open.has(id)) e.open.delete(id); else e.open.add(id);
+    renderTree(e, body, `[data-twist="${CSS.escape(id)}"]`);
+  }));
+  $$("[data-mod]", body).forEach((b) => b.addEventListener("click", () => {
+    const m = byId.get(b.dataset.mod);
+    const holder = pickedAncestor(m);
+    if (holder) {
+      toast(`Already included in “${holder.title}”. Untick it to pick the folders inside it one by one.`);
+      return;
+    }
+    if (e.picked.has(m.id)) e.picked.delete(m.id);
+    else {
+      e.picked.add(m.id);
+      // Folders inside it are now included, so they aren't separate sections any more.
+      const inside = (id) => (kids.get(id) || []).forEach((c) => { e.picked.delete(c.id); inside(c.id); });
+      inside(m.id);
+    }
+    renderTree(e, body, `[data-mod="${CSS.escape(m.id)}"]`);
+  }));
+  if (focusSel) { const el = $(focusSel, body); if (el) el.focus(); }
 }
 
 function renderPermissions() {
@@ -423,7 +513,7 @@ async function gameView(code) {
     catch (e) {
       stopPolling();
       main.innerHTML = `<section class="card"><h2>Game unavailable</h2><p class="muted">${esc(e.message)}</p>
-        <div class="row"><a class="btn dark" href="#/join/${esc(code)}">Join this game</a><a class="btn line" href="#/">Back to start</a></div></section>`;
+        <div class="btn-row"><a class="btn dark" href="#/join/${esc(code)}">Join this game</a><a class="btn line" href="#/">Back to start</a></div></section>`;
     }
   };
   await tick();
@@ -437,16 +527,21 @@ function render(s) {
   if (game.phase !== phase) {
     game.phase = phase;
     painted.clear();
+    // Two columns, balanced so neither runs much longer than the other.
     main.innerHTML = phase === "play"
-      ? `<div id="r-head"></div><div class="grid g-side"><div class="grid"><div id="r-card"></div><div id="r-notices"></div></div>
-          <div class="grid"><div id="r-host"></div><div id="r-players"></div><details class="card tight" id="r-more"><summary><b>Add more material</b></summary><div id="r-upload"></div></details><div id="r-leave"></div></div></div>`
-      : `<div id="r-head"></div><div id="r-notices"></div><div class="grid g-side"><div class="grid"><div id="r-sections"></div><div id="r-upload"></div></div>
-          <div class="grid"><div id="r-host"></div><div id="r-players"></div><div id="r-leave"></div></div></div>`;
+      ? `<div id="r-head"></div><div class="grid g-side eq">
+          <div class="col"><div id="r-card"></div><div id="r-notices"></div><div id="r-picked"></div>
+            <details class="more" id="r-more"><summary class="btn line wide more-btn">${ICON.plus}<span>Add more material</span></summary><div class="card tight" id="r-upload"></div></details></div>
+          <div class="col"><div id="r-host"></div><div id="r-players"></div><div id="r-leave"></div></div></div>`
+      : `<div id="r-head"></div><div id="r-notices"></div><div class="grid g-side eq">
+          <div class="col"><div id="r-upload"></div></div>
+          <div class="col"><div id="r-host"></div><div id="r-sections"></div><div id="r-players"></div><div id="r-leave"></div></div></div>`;
   }
   patch("r-head", headHTML(s));
   patch("r-notices", noticesHTML(s));
   patch("r-sections", sectionsHTML(s));
   patch("r-players", playersHTML(s));
+  patch("r-picked", s.picked && s.picked.length ? `<section class="card tight"><p class="eyebrow">Brightspace files in this deck</p>${s.picked.map(pickedHTML).join("")}</section>` : "");
   patch("r-host", hostHTML(s), bindHost);
   patch("r-upload", uploadHTML(s), bindUpload);
   patch("r-card", cardHTML(s), bindCard);
@@ -482,7 +577,15 @@ function sectionsHTML(s) {
       return `<li><b>${esc(st.label)}</b><div class="counts">${tag(c.brightspace, "from Brightspace")}${tag(c.upload, "from files")}${tag(c.notes, "from notes")}</div></li>`;
     }).join("")}</ul>
     <p class="hint">Counts are passages of material. Brightspace material is read when the host builds the deck.</p>
+    ${(s.picked || []).map(pickedHTML).join("")}
   </section>`;
+}
+
+function pickedHTML(p) {
+  const how = p.how === "ai" ? `The AI picked ${p.files.length} of ${p.of} files` : p.how === "titles" ? `Picked ${p.files.length} of ${p.of} files whose titles match your topics` : `Read ${p.files.length} of ${p.of} files`;
+  return `<details class="picked"><summary><b>${esc(p.course)}</b>: ${how}</summary>
+    ${p.folders && p.folders.length ? `<p class="small muted">Opened whole: ${p.folders.map(esc).join("; ")}</p>` : ""}
+    <ul>${p.files.map((f) => `<li>${esc(f)}</li>`).join("")}</ul></details>`;
 }
 
 function playersHTML(s) {
@@ -513,7 +616,11 @@ function hostHTML(s) {
       <div class="spread"><div><p class="eyebrow">Deck</p><h2>${esc(s.deck.remaining)} left</h2></div>${s.deck.refilling ? '<span class="pill">Writing more…</span>' : ""}</div>
       <div class="meter" data-pct="${pct}"><i></i></div>
       <p class="small muted">${esc(s.deck.total)} written so far by ${esc(s.generator)}. ${s.deck.refilling ? "New cards are on the way." : "Refills automatically when it runs low."}</p>
-      ${s.role === "host" ? `<button class="btn dark big wide" type="button" id="drawBtn">${s.card ? "Draw next card" : "Draw first card"}</button>` : '<p class="small muted">The host draws each card.</p>'}
+      ${s.role === "host"
+        ? (s.card && !s.my_answer
+          ? `<button class="btn dark big wide" type="button" id="drawBtn" disabled aria-describedby="drawWait">Draw next card</button><p class="small muted" id="drawWait">Answer this card first${s.card.type === "fill_blank" ? " (or press I don't know)" : ""}, then you can draw the next one.</p>`
+          : `<button class="btn dark big wide" type="button" id="drawBtn">${s.card ? "Draw next card" : "Draw first card"}</button>`)
+        : '<p class="small muted">The host draws each card.</p>'}
     </section>`;
   }
   const mine = s.players.find((p) => p.me);
@@ -546,12 +653,12 @@ function uploadHTML(s) {
   if (s.status === "building") return "";
   const inPlay = s.status === "ready";
   return `${inPlay ? "" : '<section class="card"><p class="eyebrow">Add material</p><h2>Your notes &amp; files</h2>'}
-    <form id="uploadForm" class="grid${inPlay ? " pad-top" : ""}" novalidate>
+    <form id="uploadForm" class="grid" novalidate>
       <label class="f">Section<select class="input" name="stratum">${s.strata.map((st) => `<option value="${esc(st.id)}">${esc(st.label)}</option>`).join("")}</select></label>
       <label class="drop" id="drop">${ICON.file}<b>Drop files or browse</b><span class="hint">PDF, Word, PowerPoint, text. Up to 15 MB each.</span>
         <input type="file" name="files" multiple accept=".pdf,.docx,.pptx,.txt,.md,.html,.htm"></label>
       <ul class="files" id="fileList"></ul>
-      <label class="f">Or paste notes<textarea class="input" name="notes" maxlength="60000" placeholder="Paste your own study notes"></textarea></label>
+      <label class="f notes-f">Or paste notes<textarea class="input" name="notes" maxlength="60000" placeholder="Paste your own study notes"></textarea></label>
       <label class="check"><input type="checkbox" name="attest" value="yes"><span>This is my own work or course material I'm allowed to share with these players. No exams, quizzes, answer keys or other students' personal information.</span></label>
       <button class="btn gold wide" type="submit">Add to the deck</button>
     </form>${inPlay ? "" : "</section>"}`;
@@ -600,10 +707,11 @@ function cardHTML(s) {
     }).join("")}</div>`;
   } else {
     body = mine ? "" : `<form class="dock" id="blankForm" novalidate><input name="answer" maxlength="80" autocomplete="off" spellcheck="false" placeholder="Type the missing word" aria-label="Your answer">
-      <button class="send" type="submit" aria-label="Submit answer">${ICON.up}</button></form>`;
+      <button class="send" type="submit" aria-label="Submit answer">${ICON.up}</button></form>
+      <div class="idk-row"><button class="btn line sm" id="idkBtn" type="button">I don't know</button></div>`;
   }
-  const result = mine ? `<div class="result ${mine.correct ? "ok" : "no"}" role="status"><b>${mine.correct ? "Correct" : "Not quite"}</b>
-      ${mine.correct ? "" : `<p>Answer: <b>${esc(mine.expected)}</b>${c.type === "fill_blank" ? ` · you wrote “${esc(mine.given)}”` : ""}</p>`}
+  const result = mine ? `<div class="result ${mine.correct ? "ok" : "no"}" role="status"><b>${mine.correct ? "Correct" : mine.skipped ? "Skipped" : "Not quite"}</b>
+      ${mine.correct ? "" : `<p>Answer: <b>${esc(mine.expected)}</b>${c.type === "fill_blank" && !mine.skipped ? ` · you wrote “${esc(mine.given)}”` : ""}</p>`}
       ${mine.explanation ? `<p class="small">${esc(mine.explanation)}</p>` : ""}</div>` : "";
   return `<article class="qcard" aria-label="Question card ${esc(c.number)}">
     <div class="strip"><b>${esc(c.label)}</b><span class="small">Card ${esc(c.number)} · ${c.type === "mcq" ? "Multiple choice" : "Fill in the blank"}</span></div>
@@ -614,7 +722,7 @@ function cardHTML(s) {
 function bindCard(el) {
   const s = game.state;
   if (!s.card) return;
-  const submit = (answer) => api(`/api/sessions/${game.code}/answer`, { method: "POST", json: { question_id: s.card.id, answer } }).then(render);
+  const submit = (answer, skip = false) => api(`/api/sessions/${game.code}/answer`, { method: "POST", json: { question_id: s.card.id, answer, skip } }).then(render);
   $$("[data-opt]", el).forEach((b) => b.addEventListener("click", () => {
     b.classList.add("picked");
     guarded(null, () => submit(Number(b.dataset.opt)));
@@ -628,18 +736,32 @@ function bindCard(el) {
       $(".send", form).classList.add("go");
       guarded($(".send", form), () => submit(form.answer.value));
     });
+    const idk = $("#idkBtn", el);
+    idk.addEventListener("click", () => guarded(idk, () => submit("", true)));
   }
 }
 
+/* Confirmation is shown in the page: window.confirm() is blocked in some
+   embedded and mobile browsers, where it returns "cancel" without showing anything. */
 function bindLeave(el) {
+  const original = el.innerHTML;
   const btn = $("#leaveBtn", el);
   btn.addEventListener("click", () => {
     const host = game.state.role === "host";
-    if (!confirm(host ? "End this game for everyone? All material and cards are deleted." : "Leave this game? Your uploaded material leaves with you.")) return;
-    guarded(btn, async () => {
+    el.innerHTML = `<div class="confirm-box" role="alertdialog" aria-labelledby="leaveQ">
+      <p id="leaveQ" class="small"><b>${host ? "End this game for everyone?" : "Leave this game?"}</b> ${host ? "All material and cards are deleted." : "Your uploaded material leaves with you."}</p>
+      <div class="btn-row"><button class="btn danger sm" type="button" id="leaveYes">${host ? "Yes, end game" : "Yes, leave"}</button>
+      <button class="btn line sm" type="button" id="leaveNo">Cancel</button></div></div>`;
+    const yes = $("#leaveYes", el);
+    yes.focus();
+    yes.addEventListener("click", () => guarded(yes, async () => {
+      stopPolling();
       await api(`/api/sessions/${game.code}/${host ? "end" : "leave"}`, { method: "POST" });
+      game = { code: null };
       location.hash = "#/";
-    });
+      toast(host ? "Game ended. Everything was deleted." : "You left the game.");
+    }));
+    $("#leaveNo", el).addEventListener("click", () => { el.innerHTML = original; bindLeave(el); $("#leaveBtn", el).focus(); });
   });
 }
 

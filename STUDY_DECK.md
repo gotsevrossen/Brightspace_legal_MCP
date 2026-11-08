@@ -15,18 +15,25 @@ server in this repository; see [POLICY_COMPLIANCE.md](POLICY_COMPLIANCE.md) §5.
    - picks one or more courses: Brightspace courses, or a course typed in by hand for uploaded material only
    - for each course, studies the **whole course**, chosen **modules**, or **topics**
      (comma-separated). Every module and every topic becomes its own *section* of the deck.
+     Folders inside folders are listed too (indented), so a course that keeps everything in one
+     folder can still be split by the folders inside it.
    - confirms, per Brightspace course, that the syllabus allows AI study tools
-   - picks **multiple choice**, **fill in the blank**, or a **mix**, and a starting deck size
+   - picks **multiple choice**, **fill in the blank**, or a **mix**, and a starting deck size (any number, 1 up to `STUDY_DECK_MAX_DECK_SIZE`)
 2. **Players** choose **Join a game**, type the 6-character code and a first name.
 3. Everyone can **add material**: drop PDF, Word, PowerPoint, text or HTML files, or paste notes,
    tagged to a section. Players connect Brightspace so the game can confirm they're enrolled.
 4. The host presses **Build deck**. The server reads the selected Brightspace modules, writes
-   questions per section, and **deals them in rotation across sections** (stratified), so every
+   questions per section, and **deals them evenly across sections** (stratified) in a random order, so every
    module and topic is covered evenly.
+   A deck reads at most 30 files per course. When a section is a
+   typed topic, or the chosen folders hold more files than that, the AI is shown an outline of
+   folder and file **titles only** (no file contents) and picks which folders to open, at any
+   depth, and which single files to read. Without an AI that can pick, titles are matched against
+   the topics instead. The lobby lists which files were read and how they were chosen.
 5. The host **draws** each card. Every player answers on their own phone; answers are checked
    (multiple choice exactly; fill in the blank allowing case, articles, accepted alternatives
    and small typos), and the scoreboard updates. The board itself handles movement.
-6. When the deck drops to about a quarter of its size, new cards are written in the background
+6. When 5 cards are left in the deck, 10 new cards are written in the background (shuffled in too)
    from the next passages of each section, never repeating earlier questions.
 7. **End game** deletes all material, questions and scores.
 
@@ -60,9 +67,43 @@ Purdue GenAI Studio.
 | `STUDY_DECK_GENAI_URL` | `https://genai.rcac.purdue.edu/api/chat/completions` | Must be an `https` URL on a `purdue.edu` host; anything else is refused. |
 | `STUDY_DECK_GENAI_MODEL` | `llama3.1:latest` | A model available in your GenAI Studio account. |
 | `STUDY_DECK_GENAI_API_KEY` | – | Server-wide GenAI Studio key. Without it, each host pastes their own key (held in memory for that game only). |
-| `STUDY_DECK_DEMO` | on when no client ID | Force demo mode on or off. |
+| `STUDY_DECK_BROWSER_MODE_ACKNOWLEDGED` | `false` | Personal sign-in (see below). Ignored when a client ID is set. |
+| `STUDY_DECK_DEMO` | on when no client ID or personal sign-in | Force demo mode on or off. |
 | `STUDY_DECK_SESSION_TTL_MINUTES` | `240` | Idle games and sign-ins are deleted after this. |
 | `STUDY_DECK_MAX_PLAYERS` | `8` | Players per game. |
+| `STUDY_DECK_MAX_DECK_SIZE` | `100` | Largest starting deck a host can choose (capped at 300; every 8 cards is one GenAI Studio request). |
+
+### Personal sign-in (your own courses, without a Purdue client ID)
+
+For one student running Study Deck on their own computer. Install the browser extra and turn it on:
+
+```bash
+pip install -e ".[web,browser]"
+```
+
+```bash
+STUDY_DECK_BROWSER_MODE_ACKNOWLEDGED=true study-deck
+```
+
+Study Deck then opens in its own window of your default browser (Google Chrome or Microsoft
+Edge; it's a separate window the app controls, not your usual one). **Connect Brightspace**
+opens Purdue's own sign-in page as a new tab in that window. You sign in and approve the
+Microsoft Authenticator prompt yourself; the app never sees your password. Once you're signed
+in the tab closes by itself and you're back on Study Deck. (Clicking Connect Brightspace in
+your usual browser on this computer works too: the sign-in tab opens in the Study Deck window,
+and once you're signed in you can keep playing in your usual browser as long as that window
+stays open.) After that it reads your enrollments, module lists and module files through the
+same read-only, allowlisted, rate-limited routes as OAuth mode. The session lives in memory only
+and ends when you disconnect, close the Study Deck window, or stop the app.
+
+Limits, on purpose:
+
+- It uses your own interactive session for automated requests, which Purdue has not explicitly
+  authorized. That is why it has to be acknowledged; read [POLICY_COMPLIANCE.md](POLICY_COMPLIANCE.md) §4 first.
+- Only a browser on the computer running the app can connect, and only while `STUDY_DECK_PUBLIC_URL`
+  is `127.0.0.1` or `localhost`.
+- Other players can't connect Brightspace in this mode, so the sharing rule keeps your course
+  material out of games they join. Use it for solo study, or have the others add their own notes.
 
 The registered Brightspace app needs these read-only scopes:
 
