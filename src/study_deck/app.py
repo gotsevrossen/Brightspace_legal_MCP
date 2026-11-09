@@ -607,7 +607,7 @@ def create_app(settings: StudyDeckSettings | None = None, *, open_window: bool =
             stratum_id = str(form.get("stratum") or "")
             if stratum_id not in {s.id for s in session.strata}:
                 raise ApiError("Pick which section this material is for.")
-            added, skipped = 0, []
+            added, skipped = [], []
             notes = str(form.get("notes") or "").strip()
             if notes:
                 from .extract import clean_text  # noqa: PLC0415
@@ -633,7 +633,21 @@ def create_app(settings: StudyDeckSettings | None = None, *, open_window: bool =
                                                         stratum_id=stratum_id))
         if not added and not skipped:
             raise ApiError("Add a file or paste some notes.")
-        return JSONResponse({"added": added, "skipped": skipped, "state": deck.view(session, user)})
+        # During play, write cards from it now rather than when its turn comes round.
+        writing = session.status == "ready" and bool(added)
+        if writing:
+            async def write_new() -> None:
+                try:
+                    await session.write_from_new(stratum_id, added)
+                except GenerationError as exc:
+                    session.notices.append(f"Couldn't write cards from the new material: {exc}")
+                except Exception:  # keep the game alive; never leak internals to players
+                    log.exception("writing cards from new material failed")
+                    session.notices.append("Couldn't write cards from the new material.")
+
+            spawn(session, write_new)
+        return JSONResponse({"added": len(added), "skipped": skipped, "writing": writing,
+                             "state": deck.view(session, user)})
 
     async def build(request: Request) -> Response:
         user = deck.user_for(request)

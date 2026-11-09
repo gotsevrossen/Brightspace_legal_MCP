@@ -869,6 +869,66 @@ async def test_cards_come_in_random_order_but_each_section_gets_its_share():
     assert batch.count("s1") == batch.count("s2") == 5
 
 
+async def test_material_added_during_play_comes_up_this_round():
+    import random
+    from study_deck.game import NEW_MATERIAL_CARDS, Chunk, GameSession, Stratum, make_chunks
+
+    seen = []
+
+    class Recording:
+        name = "recording"
+
+        async def generate(self, material, label, focus, types, count, avoid):
+            seen.append(material)
+            return [{"type": "fill_blank", "prompt": f"{label} {len(seen)}.{i} is _____ here.", "answer": "word",
+                     "accept": [], "explanation": ""} for i in range(count)]
+
+    strata = [Stratum(id=f"s{i}", course_label=f"C{i}", org_id=None, kind="course") for i in (1, 2)]
+    s = GameSession(code="ABCDEF", host_id="h", strata=strata, types=["fill_blank"], deck_size=20,
+                    generator=Recording(), rng=random.Random(3), status="ready")
+    for st in strata:
+        s.add_chunks([Chunk(text=f"Original material for {st.id}. " * 400, source="notes", contributor="h",
+                            stratum_id=st.id)])
+    await s.generate(20)
+    for _ in range(6):
+        s.draw()
+    drawn, before = s.deck[: s.cursor], len(s.deck)
+
+    upload = "Brand new material from a player. " * 20
+    added = s.add_chunks(make_chunks(upload, source="upload", contributor="p", stratum_id="s2"))
+    assert added and s.add_chunks(make_chunks(upload, source="upload", contributor="p", stratum_id="s2")) == []
+    seen.clear()
+    assert await s.write_from_new("s2", added) == NEW_MATERIAL_CARDS
+
+    # Written from the new material only, and placed among the cards not yet drawn.
+    assert len(seen) == 1 and "Brand new material" in seen[0] and "Original" not in seen[0]
+    assert len(s.deck) == before + NEW_MATERIAL_CARDS and s.deck[: s.cursor] == drawn
+    new = [q for q in s.deck[s.cursor:] if q.prompt.startswith("C2 · whole course 1.")]
+    assert len(new) == NEW_MATERIAL_CARDS and all(q.stratum_id == "s2" for q in new)
+
+    # Nothing is added once the game has ended.
+    s.status = "ended"
+    more = s.add_chunks(make_chunks("Even more new material from someone. " * 20, source="upload",
+                                    contributor="p", stratum_id="s1"))
+    assert await s.write_from_new("s1", more) == 0
+
+
+async def test_upload_during_play_writes_cards_right_away(app):
+    host, code, _ = await make_game(app)
+    await host.post(f"/api/sessions/{code}/build")
+    state = await wait_for(host, code, "ready")
+    total = state["deck"]["total"]
+    psy = next(s["id"] for s in state["strata"] if s["course"] == "PSY 1200")
+    r = await host.post(f"/api/sessions/{code}/upload", data={"stratum": psy, "notes": PSY_NOTES, "attest": "yes"})
+    assert r.status_code == 200 and r.json()["writing"] is True
+    for _ in range(50):
+        state = (await host.get(f"/api/sessions/{code}")).json()
+        if state["deck"]["total"] > total:
+            break
+        await asyncio.sleep(0.1)
+    assert state["deck"]["total"] > total and state["deck"]["remaining"] > total - 1
+
+
 # ------------------------------------------------- folders inside folders, AI picking
 
 

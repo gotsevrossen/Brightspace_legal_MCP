@@ -32,6 +32,11 @@ REFILL_AT = 5
 # ...and this many at a time.
 REFILL_CARDS = 10
 TOPIC_CHUNKS = 12
+# Material added during play gets cards of its own right away, mixed into the cards
+# still to come: this many per window of new material, for at most this many
+# windows. Anything past that joins the section's normal top-up rotation.
+NEW_MATERIAL_CARDS = 5
+NEW_MATERIAL_WINDOWS = 2
 
 
 @dataclass
@@ -163,14 +168,15 @@ class GameSession:
 
     # ----------------------------------------------------------------- material
 
-    def add_chunks(self, chunks: list[Chunk]) -> int:
+    def add_chunks(self, chunks: list[Chunk]) -> list[Chunk]:
+        """Add material, skipping passages already in the game. Returns the ones added."""
         known = {c.digest for c in self.chunks}
-        added = 0
+        added = []
         for chunk in chunks:
             if chunk.digest not in known:
                 self.chunks.append(chunk)
                 known.add(chunk.digest)
-                added += 1
+                added.append(chunk)
         return added
 
     def material_for(self, stratum: Stratum) -> list[Chunk]:
@@ -241,13 +247,7 @@ class GameSession:
                     min(BATCH_SIZE, want - len(got)), self.used_prompts,
                 )
                 for q in batch:
-                    q = shuffle_options(q, self.rng)
-                    question = Question(
-                        id=secrets.token_hex(6), stratum_id=stratum.id, label=stratum.label, type=q["type"],
-                        prompt=q["prompt"], explanation=q.get("explanation", ""), options=q.get("options", []),
-                        answer_index=q.get("answer_index"), answer=q.get("answer"), accept=q.get("accept", []),
-                    )
-                    got.append(question)
+                    got.append(self._question(stratum, q))
                     self.used_prompts.append(q["prompt"])
             per_stratum[stratum.id] = got[:want]
         # Every section gets its fair share of each batch (stratified), and the batch is
@@ -256,6 +256,45 @@ class GameSession:
         self.rng.shuffle(batch)
         self.deck.extend(batch)
         return len(batch)
+
+    def _question(self, stratum: Stratum, q: dict[str, Any]) -> Question:
+        q = shuffle_options(q, self.rng)
+        return Question(
+            id=secrets.token_hex(6), stratum_id=stratum.id, label=stratum.label, type=q["type"],
+            prompt=q["prompt"], explanation=q.get("explanation", ""), options=q.get("options", []),
+            answer_index=q.get("answer_index"), answer=q.get("answer"), accept=q.get("accept", []),
+        )
+
+    async def write_from_new(self, stratum_id: str, chunks: list[Chunk]) -> int:
+        """Write cards from material added during play and shuffle them into the cards
+        still to come. Without this, new material waits its turn in the section's
+        rotation and can take several top-ups to reach the deck."""
+        stratum = next((s for s in self.strata if s.id == stratum_id), None)
+        if stratum is None or not chunks:
+            return 0
+        windows, part = [], ""
+        for c in chunks:
+            if part and len(part) + len(c.text) > MATERIAL_CHARS_PER_CALL:
+                windows.append(part)
+                part = ""
+            part = f"{part}\n\n---\n\n{c.text}" if part else c.text
+        if part:
+            windows.append(part)
+        new: list[Question] = []
+        for material in windows[:NEW_MATERIAL_WINDOWS]:
+            batch = await self.generator.generate(
+                material[: MATERIAL_CHARS_PER_CALL + 1500], stratum.label, stratum.topic, self.types,
+                NEW_MATERIAL_CARDS, self.used_prompts,
+            )
+            for q in batch[:NEW_MATERIAL_CARDS]:
+                new.append(self._question(stratum, q))
+                self.used_prompts.append(q["prompt"])
+        if self.status != "ready":
+            return 0
+        # Anywhere among the cards not yet drawn, so they come up this round.
+        for q in new:
+            self.deck.insert(self.rng.randint(self.cursor, len(self.deck)), q)
+        return len(new)
 
     def refill_threshold(self) -> int:
         # New cards are written when 5 are left (fewer for tiny decks, so they

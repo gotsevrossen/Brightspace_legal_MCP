@@ -697,7 +697,7 @@ function bindUpload(el) {
       if (!form.attest.checked) throw new Error("Confirm you're allowed to share this material.");
       const res = await api(`/api/sessions/${game.code}/upload`, { method: "POST", form: new FormData(form) });
       form.reset(); list.innerHTML = "";
-      const what = `Added ${res.added} passage${res.added === 1 ? "" : "s"} of material.`;
+      const what = `Added ${res.added} passage${res.added === 1 ? "" : "s"} of material.${res.writing ? " Cards from it are being written and will be mixed into the cards still to come." : ""}`;
       toast(res.skipped.length ? `${what} Skipped: ${res.skipped.join("; ")}` : what, res.skipped.length > 0);
       render(res.state);
     });
