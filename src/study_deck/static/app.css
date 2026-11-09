@@ -144,37 +144,50 @@ details.card summary{cursor:pointer;min-height:28px;display:flex;align-items:cen
 
 /* chips: multi-select, pressed = gold */
 .chips{display:flex;flex-wrap:wrap;gap:8px}
-/* Folder tree */
-.ftree,.fkids{list-style:none;margin:0;padding:0;display:grid;gap:2px}
-.ftree{border:1.5px solid var(--line);border-radius:16px;padding:6px;background:var(--paper)}
-.fkids{margin:2px 0 4px 21px;padding-left:10px;border-left:1.5px solid var(--line)}
-.fkids[hidden]{display:none}
-.frow{display:flex;align-items:center;gap:2px}
-.twist,.twist-gap{width:32px;height:32px;flex:0 0 auto}
-.twist{border:0;background:none;border-radius:10px;display:grid;place-items:center;color:var(--muted);cursor:pointer;padding:0}
-.twist:hover{background:var(--ground);color:var(--ink)}
-.twist svg{transition:transform .15s ease}
-.twist[aria-expanded="true"] svg{transform:rotate(90deg)}
-.ftree.flat .twist-gap{display:none}
-.fpick{flex:1;min-width:0;min-height:44px;display:flex;align-items:center;gap:10px;padding:8px 12px;border:0;border-radius:12px;
+/* Folder picker: one card per top folder; the folders inside open in a panel within the card */
+.fcards,.fsubs{list-style:none;margin:0;padding:0;display:grid}
+.fcards{gap:10px;margin-bottom:10px}
+.fcard{border:1.5px solid var(--line);border-radius:20px;background:var(--paper);transition:border-color .15s ease,background .15s ease}
+.fcard:hover{border-color:rgba(0,0,0,.32)}
+.fcard[data-state="on"]{border-color:var(--ink);background:var(--gold)}
+.fcard-head{display:flex;align-items:center;flex-wrap:wrap;gap:4px 8px;padding:6px 10px 6px 6px}
+.fpick{flex:1 1 200px;min-width:0;min-height:48px;display:flex;align-items:center;gap:12px;padding:8px;border:0;border-radius:14px;
   background:transparent;color:var(--ink);font:inherit;text-align:left;cursor:pointer}
-.fpick:hover{background:var(--ground)}
-.fpick .tick{width:18px;height:18px;border-radius:6px;border:1.5px solid currentColor;display:grid;place-items:center;flex:0 0 auto}
+.fpick .tick{width:24px;height:24px;border-radius:50%;border:1.5px solid rgba(0,0,0,.45);background:var(--paper);
+  display:grid;place-items:center;flex:0 0 auto;transition:background .15s ease,border-color .15s ease}
 .fpick[aria-pressed="false"] .tick svg{visibility:hidden}
-.fname{flex:1;min-width:0;font-family:var(--display);font-weight:700;font-size:.92rem;overflow-wrap:anywhere}
-.fmeta{flex:0 0 auto;font-size:.76rem;color:var(--muted);white-space:nowrap}
+.ftext{display:grid;min-width:0}
+.fname{font-family:var(--display);font-weight:800;font-size:.97rem;line-height:1.2;overflow-wrap:anywhere}
+.fmeta{font-size:.76rem;color:var(--muted)}
 .fmeta b{color:var(--gold-ink);font-weight:700}
-.frow[data-state="on"] .fpick{background:var(--gold)}
-.frow[data-state="on"] .fmeta{color:rgba(0,0,0,.7)}
-.frow[data-state="on"] .tick{background:var(--ink);border-color:var(--ink);color:var(--gold)}
-.frow[data-state="included"] .fpick{background:var(--gold-tint);cursor:default}
-.frow[data-state="included"] .tick{background:var(--gold-ink);border-color:var(--gold-ink);color:#fff}
+.fcard[data-state="on"]>.fcard-head .fmeta{color:rgba(0,0,0,.7)}
+.fcard[data-state="on"]>.fcard-head .tick,
+.fsub[data-state="on"]>.fsub-row .tick{background:var(--ink);border-color:var(--ink);color:var(--gold)}
+.fsub[data-state="included"]>.fsub-row .tick{background:var(--gold-ink);border-color:var(--gold-ink);color:#fff}
+.fsub[data-state="included"]>.fsub-row .fpick{cursor:default}
+/* '2 folders' / 'Hide' pill on a card */
+.fmore{display:inline-flex;align-items:center;gap:6px;min-height:38px;padding:0 12px 0 14px;border-radius:999px;border:1.5px solid var(--line);
+  background:var(--paper);color:var(--ink);font-size:.8rem;font-weight:700;white-space:nowrap;flex:0 0 auto;margin-left:auto}
+.fmore:hover{border-color:var(--ink)}
+.fmore svg,.fmini svg{transform:rotate(90deg);transition:transform .18s ease}
+.fmore[aria-expanded="true"] svg,.fmini[aria-expanded="true"] svg{transform:rotate(-90deg)}
+/* Folders inside a card */
+.fcard>.fsubs{margin:0 10px 10px;padding:6px;border-radius:14px;background:var(--ground);gap:2px}
+.fcard[data-state="on"]>.fsubs{background:rgba(255,255,255,.55)}
+.fsubs .fsubs{margin:2px 0 2px 22px;gap:2px}
+.fsub-row{display:flex;align-items:center;gap:4px;border-radius:12px;transition:background .15s ease}
+.fsub-row .fpick{min-height:44px;padding:6px 8px;gap:10px;border-radius:12px}
+.fsub-row .fpick:hover{background:rgba(0,0,0,.04)}
+.fsub-row .tick{width:20px;height:20px}
+.fsub-row .fname{font-size:.9rem;font-weight:700}
+.fsub[data-state="on"]>.fsub-row{background:var(--paper);box-shadow:inset 0 0 0 1.5px var(--ink)}
+.fsub[data-state="on"]>.fsub-row .fpick:hover{background:transparent}
+.fmini{width:36px;height:36px;border-radius:50%;border:0;background:transparent;display:grid;place-items:center;color:var(--muted);flex:0 0 auto;padding:0}
+.fmini:hover{background:rgba(0,0,0,.07);color:var(--ink)}
 @media (max-width:520px){
-  .fpick{flex-wrap:wrap;row-gap:2px;padding:8px 10px}
-  .fname{flex:1 1 calc(100% - 28px)}
-  .fmeta{flex-basis:100%;padding-left:28px;white-space:normal}
-  .fkids{margin-left:15px;padding-left:6px}
-  .twist,.twist-gap{width:28px}
+  .fcard-head{padding:4px 8px 8px 4px}
+  .fmore{margin-left:44px}
+  .fsubs .fsubs{margin-left:12px}
 }
 .picked{margin-top:12px;padding:12px 14px;border-radius:var(--r-sm);background:var(--ground)}
 .picked summary{cursor:pointer;font-size:.86rem}

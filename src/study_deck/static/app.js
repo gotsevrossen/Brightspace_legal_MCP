@@ -395,34 +395,50 @@ function renderTree(e, body, focusSel) {
     kids.get(p).push(m);
   });
   const nested = e.modules.some((m) => kids.has(m.id));
-  // Start with the top level open; in big courses deeper folders start folded.
-  if (!e.open) e.open = new Set(e.modules.filter((m) => kids.has(m.id) && (e.modules.length <= 20 || !m.parent)).map((m) => m.id));
+  // Each top folder is a card with its folders folded away, so the list stays short.
+  // Folders holding a pick start open so the pick stays in view.
+  if (!e.open) {
+    e.open = new Set();
+    e.picked.forEach((id) => { for (let p = byId.get(byId.get(id)?.parent); p; p = byId.get(p.parent)) e.open.add(p.id); });
+  }
   const pickedAncestor = (m) => {
     for (let p = byId.get(m.parent); p; p = byId.get(p.parent)) if (e.picked.has(p.id)) return p;
     return null;
   };
   const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
-  const row = (m) => {
+  const stateOf = (m) => e.picked.has(m.id) ? "on" : pickedAncestor(m) ? "included" : "off";
+  const pick = (m, state, folderCount) => `
+    <button type="button" class="fpick" data-mod="${esc(m.id)}" aria-pressed="${state !== "off"}"${state === "included" ? ' aria-disabled="true"' : ""} title="${esc(m.label || m.title)}">
+      <span class="tick">${ICON.check}</span>
+      <span class="ftext"><span class="fname">${esc(m.title)}</span>
+        <span class="fmeta">${state === "included" ? "<b>Included</b> · " : ""}${plural(m.files, "file")}${folderCount ? ` · ${plural(folderCount, "folder")}` : ""}</span></span>
+    </button>`;
+  const sub = (m) => {
     const children = kids.get(m.id) || [];
     const open = e.open.has(m.id);
-    const state = e.picked.has(m.id) ? "on" : pickedAncestor(m) ? "included" : "off";
-    return `<li class="fnode">
-      <div class="frow" data-state="${state}">
-        ${children.length
-          ? `<button type="button" class="twist" data-twist="${esc(m.id)}" aria-expanded="${open}" aria-label="${open ? "Fold" : "Unfold"} ${esc(m.title)}">${ICON.chev}</button>`
-          : '<span class="twist-gap" aria-hidden="true"></span>'}
-        <button type="button" class="fpick" data-mod="${esc(m.id)}" aria-pressed="${state !== "off"}"${state === "included" ? ' aria-disabled="true"' : ""} title="${esc(m.label || m.title)}">
-          <span class="tick">${ICON.check}</span>
-          <span class="fname">${esc(m.title)}</span>
-          <span class="fmeta">${state === "included" ? "<b>Included</b> · " : ""}${plural(m.files, "file")}${children.length ? ` · ${plural(children.length, "folder")}` : ""}</span>
-        </button>
+    const state = stateOf(m);
+    return `<li class="fsub" data-state="${state}">
+      <div class="fsub-row">${pick(m, state, children.length)}
+        ${children.length ? `<button type="button" class="fmini" data-twist="${esc(m.id)}" aria-expanded="${open}" aria-label="${open ? "Hide" : "Show"} the folders in ${esc(m.title)}">${ICON.chev}</button>` : ""}
       </div>
-      ${children.length ? `<ul class="fkids"${open ? "" : " hidden"}>${children.map(row).join("")}</ul>` : ""}
+      ${children.length && open ? `<ul class="fsubs">${children.map(sub).join("")}</ul>` : ""}
+    </li>`;
+  };
+  const card = (m) => {
+    const children = kids.get(m.id) || [];
+    const open = e.open.has(m.id);
+    const state = stateOf(m);
+    const count = plural(children.length, "folder");
+    return `<li class="fcard" data-state="${state}">
+      <div class="fcard-head">${pick(m, state, 0)}
+        ${children.length ? `<button type="button" class="fmore" data-twist="${esc(m.id)}" aria-expanded="${open}" aria-label="${open ? "Hide the folders" : `Show ${count}`} in ${esc(m.title)}"><span>${open ? "Hide" : count}</span>${ICON.chev}</button>` : ""}
+      </div>
+      ${children.length && open ? `<ul class="fsubs">${children.map(sub).join("")}</ul>` : ""}
     </li>`;
   };
   const n = e.picked.size;
-  body.innerHTML = `<ul class="ftree${nested ? "" : " flat"}" aria-label="Folders in ${esc(e.name)}">${(kids.get("") || []).map(row).join("")}</ul>
-    <p class="hint">${n ? `<b>${plural(n, "folder")} picked</b>, so ${plural(n, "section")} in the deck. ` : ""}${nested ? "Picking a folder includes every folder inside it; to choose inside it instead, unfold it and pick those. " : ""}If your picks hold more files than a deck reads at once, the AI chooses the most useful ones.</p>`;
+  body.innerHTML = `<ul class="fcards" aria-label="Folders in ${esc(e.name)}">${(kids.get("") || []).map(card).join("")}</ul>
+    <p class="hint">${n ? `<b>${plural(n, "folder")} picked</b>, so ${plural(n, "section")} in the deck. ` : ""}${nested ? "Picking a folder includes every folder inside it; to choose inside it instead, open its folders and pick those. " : ""}If your picks hold more files than a deck reads at once, the AI chooses the most useful ones.</p>`;
   $$("[data-twist]", body).forEach((b) => b.addEventListener("click", () => {
     const id = b.dataset.twist;
     if (e.open.has(id)) e.open.delete(id); else e.open.add(id);
