@@ -21,18 +21,55 @@ from .extract import STOPWORDS
 BLANK = "_____"
 QUESTION_TYPES = ("mcq", "fill_blank")
 
+# Each passage of material sent to the model starts with one of these lines, so it
+# can tell the instructor's Brightspace material from players' own notes and files.
+SOURCE_LINES = {
+    "brightspace": "[Source: Brightspace course material]",
+    "upload": "[Source: a player's uploaded file]",
+    "notes": "[Source: a player's notes]",
+}
+_SOURCE_LINE = re.compile(r"^\[Source: [^\]\n]*\]\n?", re.MULTILINE)
+
+
+def tag_source(source: str, text: str) -> str:
+    return f"{SOURCE_LINES.get(source, SOURCE_LINES['notes'])}\n{text}"
+
+
+def strip_sources(material: str) -> str:
+    return _SOURCE_LINE.sub("", material)
+
+
 SYSTEM_PROMPT = """You write short study questions for a university student's review game.
 Rules:
 - Use ONLY the course material provided. Never invent facts that are not in it.
 - Ask about concepts, definitions, processes and relationships. Never ask about people's names,
   contact details, dates of class meetings, grades or course logistics.
+Wording:
+- Each passage of material starts with a source line: "[Source: Brightspace course material]",
+  "[Source: a player's notes]" or "[Source: a player's uploaded file]".
+- Follow the material's wording strictly. Use its exact terms, definitions, phrasing, spelling,
+  notation and units in prompts, answers, options and explanations. Do not swap in synonyms or
+  restate a definition in your own words.
+- Brightspace course material is the instructor's wording and comes first. When passages word
+  the same idea differently, use the Brightspace wording. Use a player's wording only for ideas
+  the Brightspace material does not cover.
+- Word every correct answer exactly as the material does.
+Question structure:
+- If the material contains questions (practice problems, review or self-check questions, worked
+  examples), copy their structure in your questions: how they open and are phrased, their
+  length, what they give and what they ask for, and how their answer options are written. If
+  there are several styles, prefer the ones in Brightspace material. Write new questions in that
+  structure; do not reuse a question from the material word for word. Stay within the question
+  types and limits below.
+- If the material contains no questions, use the formats below as they are.
+Formats:
 - Keep each question under 220 characters and each answer option under 80 characters.
 - Multiple choice ("mcq"): exactly 4 options, exactly one correct, plausible distractors, no
   "all of the above" or "none of the above".
 - Fill in the blank ("fill_blank"): one sentence containing "_____" exactly once; the missing
   answer is 1 to 4 words and must not appear elsewhere in the sentence. List acceptable
-  alternative spellings or synonyms in "accept".
-- Add a one-sentence "explanation" grounded in the material.
+  alternative spellings or synonyms in "accept"; "answer" itself stays in the material's wording.
+- Add a one-sentence "explanation" grounded in the material and using its wording.
 - Do not repeat or closely paraphrase any question listed under "Avoid".
 Reply with JSON only, no prose, in this shape:
 {"questions":[
@@ -243,6 +280,7 @@ class OfflineGenerator:
         self.random = random.Random(seed)
 
     async def generate(self, material, label, focus, types, count, avoid):
+        material = strip_sources(material)
         sentences = [
             s.strip()
             for s in re.split(r"(?<=[.!?])\s+", material.replace("\n", " "))

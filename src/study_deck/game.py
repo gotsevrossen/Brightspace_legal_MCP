@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .extract import chunk_text, relevance
-from .genai import BLANK, GenerationError, Generator
+from .genai import BLANK, GenerationError, Generator, tag_source
 
 CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 MATERIAL_CHARS_PER_CALL = 6000
@@ -209,7 +209,9 @@ class GameSession:
         start = self.stratum_cursor.get(stratum.id, 0) % len(pool)
         parts, size, i = [], 0, start
         while size < MATERIAL_CHARS_PER_CALL:
-            text = pool[i % len(pool)].text
+            chunk = pool[i % len(pool)]
+            # Labelled so the model can favour the instructor's Brightspace wording.
+            text = tag_source(chunk.source, chunk.text)
             parts.append(text)
             size += len(text)
             i += 1
@@ -274,10 +276,11 @@ class GameSession:
             return 0
         windows, part = [], ""
         for c in chunks:
-            if part and len(part) + len(c.text) > MATERIAL_CHARS_PER_CALL:
+            text = tag_source(c.source, c.text)
+            if part and len(part) + len(text) > MATERIAL_CHARS_PER_CALL:
                 windows.append(part)
                 part = ""
-            part = f"{part}\n\n---\n\n{c.text}" if part else c.text
+            part = f"{part}\n\n---\n\n{text}" if part else text
         if part:
             windows.append(part)
         new: list[Question] = []

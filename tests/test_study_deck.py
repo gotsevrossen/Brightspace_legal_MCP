@@ -433,6 +433,37 @@ async def test_offline_generator_writes_valid_cards():
     assert cards and all(c["type"] in ("mcq", "fill_blank") for c in cards)
 
 
+def test_material_is_labelled_by_source_for_the_ai():
+    from study_deck.game import Chunk, GameSession, Stratum
+    from study_deck.genai import SYSTEM_PROMPT, SOURCE_LINES
+
+    st = Stratum(id="s1", course_label="BIOL 1100", org_id=5, kind="course")
+    s = GameSession(code="ABCDEF", host_id="h", strata=[st], types=["mcq"], deck_size=8, generator=OfflineGenerator())
+    s.add_chunks([Chunk(text="The instructor's own wording.", source="brightspace", contributor="h", org_id=5),
+                  Chunk(text="A player's own notes.", source="notes", contributor="p", stratum_id="s1"),
+                  Chunk(text="A player's uploaded file.", source="upload", contributor="p", stratum_id="s1")])
+    window = s.next_window(st)
+    assert f"{SOURCE_LINES['brightspace']}\nThe instructor's own wording." in window
+    assert f"{SOURCE_LINES['notes']}\nA player's own notes." in window
+    assert f"{SOURCE_LINES['upload']}\nA player's uploaded file." in window
+    # The instructions name every label and say how to use them.
+    assert all(line in SYSTEM_PROMPT for line in SOURCE_LINES.values())
+    for rule in ("Follow the material's wording strictly", "use the Brightspace wording",
+                 "copy their structure", "do not reuse a question from the material word for word"):
+        assert rule in SYSTEM_PROMPT
+
+
+async def test_offline_generator_ignores_source_labels():
+    from study_deck.genai import tag_source
+
+    material = "\n\n---\n\n".join([
+        tag_source("brightspace", "Merge sort divides the list in half and merges the sorted halves together."),
+        tag_source("notes", "Binary search repeatedly halves a sorted list and runs in logarithmic time."),
+    ])
+    cards = await OfflineGenerator(seed=2).generate(material, "CS", None, ["mcq", "fill_blank"], 4, [])
+    assert cards and not any("Source" in c["prompt"] or "[" in c["prompt"] for c in cards)
+
+
 def test_extract_office_files_and_chunking():
     import docx
     from pptx import Presentation
