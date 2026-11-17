@@ -67,7 +67,8 @@ h3{font-size:1rem;font-weight:800;letter-spacing:-.01em}
 .notice{background:var(--paper);border:1.5px solid var(--gold);border-radius:var(--r-sm);padding:14px 16px;display:flex;gap:12px;align-items:flex-start}
 .notice svg{flex:0 0 auto;margin-top:2px}
 .notice p{margin:0}
-.notice.demo{background:var(--gold-tint);border-color:transparent}
+.notice.good,.notice.invite{background:var(--gold-tint);border-color:transparent}
+.url{white-space:nowrap;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-weight:700}
 
 /* ---- buttons ---- */
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:48px;padding:0 20px;border-radius:16px;
@@ -226,6 +227,9 @@ details.card summary{cursor:pointer;min-height:28px;display:flex;align-items:cen
 .course-block header{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
 .course-block h3{text-transform:none;font-size:1.05rem}
 .tag{font-size:.7rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--gold-ink)}
+.tag.bx{margin-left:8px;padding:2px 8px;border-radius:999px;background:var(--gold-tint);color:var(--ink)}
+.counts .bx{font-weight:700}
+.strip .past{display:inline-block;padding:1px 8px;border-radius:999px;background:var(--ink);color:var(--gold);font-weight:700}
 
 /* steps */
 .step{display:grid;gap:16px}
@@ -245,7 +249,11 @@ details.card summary{cursor:pointer;min-height:28px;display:flex;align-items:cen
 
 /* players */
 .players{display:grid;gap:2px;margin:0;padding:0;list-style:none}
-.players li{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:12px;align-items:center;padding:10px 4px}
+.players li{display:grid;grid-template-columns:auto minmax(0,1fr);grid-auto-flow:column;grid-auto-columns:auto;gap:12px;align-items:center;padding:10px 4px}
+.players li .x-btn{width:44px;height:44px;color:var(--muted)}
+.players li .x-btn:hover,.players li .x-btn:focus-visible{color:var(--bad)}
+.players li .x-space{width:44px}
+.kick-box{grid-column:1/-1}
 .players li+li{border-top:1px solid var(--line)}
 .avatar{width:36px;height:36px;border-radius:50%;background:var(--gold);display:grid;place-items:center;font-family:var(--display);font-weight:900}
 .players .me .avatar{background:var(--ink);color:var(--gold)}
@@ -259,6 +267,19 @@ details.card summary{cursor:pointer;min-height:28px;display:flex;align-items:cen
 .drop input{position:absolute;width:1px;height:1px;opacity:0}
 .drop b{font-family:var(--display);font-weight:800}
 .files{margin:0;padding:0;list-style:none;display:grid;gap:4px;font-size:.84rem}
+.tight-gap{gap:8px}
+.folder-btn{position:relative}
+.folder-btn input{position:absolute;width:1px;height:1px;opacity:0}
+.picked-files{display:grid;gap:8px;padding:12px 14px;border-radius:var(--r-sm);background:var(--ground)}
+.picked-head{display:flex;align-items:baseline;gap:10px}
+.picked-head .link-btn{margin-left:auto}
+.picked-files .files{max-height:240px;overflow-y:auto}
+.picked-files li{display:flex;align-items:center;gap:10px;min-width:0}
+.fname{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.link-btn{background:none;border:0;padding:4px 0;font:inherit;font-size:.84rem;font-weight:700;color:var(--ink);text-decoration:underline;cursor:pointer}
+.x-btn{flex:none;width:32px;height:32px;border:0;border-radius:50%;background:transparent;color:var(--ink);font-size:1.2rem;line-height:1;cursor:pointer}
+.x-btn:hover,.x-btn:focus-visible{background:rgba(0,0,0,.08)}
+.err-text{margin:0;color:var(--bad);font-weight:600}
 
 /* toggle */
 .switch{display:flex;align-items:center;justify-content:space-between;gap:14px;cursor:pointer}
@@ -291,6 +312,13 @@ details.card summary{cursor:pointer;min-height:28px;display:flex;align-items:cen
 .opt.wrong{border-color:var(--bad);background:#FBECEA}
 .opt.wrong .letter{background:var(--bad);color:#fff}
 .opt:disabled{cursor:default}
+.opt.static:hover{border-color:var(--line)}
+.opt.static.right:hover{border-color:var(--ok)}
+.opt.static.wrong:hover{border-color:var(--bad)}
+/* who answers this card: a picker on the host's screen, a note on everyone else's */
+.turn-pick{display:flex;align-items:center;gap:10px;margin:0 0 14px;font-weight:700;font-size:.9rem}
+.turn-pick .input{flex:1;min-width:0;max-width:260px}
+.turn-note{margin:0 0 14px;padding:10px 14px;border-radius:var(--r-sm);background:var(--gold-tint);font-size:.92rem}
 
 /* composer for fill in the blank, after the LightHouse dock + send button */
 .dock{display:flex;align-items:center;gap:10px;padding:8px;border-radius:var(--r-md);background:var(--paper);
@@ -342,3 +370,14 @@ details.card summary{cursor:pointer;min-height:28px;display:flex;align-items:cen
 @media (prefers-reduced-motion:reduce){
   *,*::before,*::after{animation:none!important;transition:none!important}
 }
+
+/* game header: join code beside a QR code that opens the join page */
+.start-items{justify-items:start}
+/* lobby header: join code card, then the QR code filling the same column as the Build deck card */
+.head-split{align-items:stretch}
+.head-main{align-content:space-between}
+/* In the lobby the join code grows with its card, up to filling its width (6 letters â‰ˆ 5.7em). */
+.head-split .head-main{container-type:inline-size}
+.head-split .code{font-size:clamp(2.4rem,16.5cqi,9rem);letter-spacing:.14em}
+.qr{display:block;width:100%;height:auto;aspect-ratio:1;border-radius:var(--r-md);background:#fff;image-rendering:pixelated}
+@media (max-width:820px){.head-split .qr{width:min(100%,320px);justify-self:center}}

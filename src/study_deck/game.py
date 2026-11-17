@@ -19,7 +19,9 @@ import re
 import secrets
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable
+import logging
+import math
+from typing import Any, Awaitable, Callable
 
 from .extract import chunk_text, relevance
 from .genai import BLANK, GenerationError, Generator, tag_source
@@ -37,13 +39,17 @@ TOPIC_CHUNKS = 12
 # windows. Anything past that joins the section's normal top-up rotation.
 NEW_MATERIAL_CARDS = 5
 NEW_MATERIAL_WINDOWS = 2
+# Share of a section's cards that are real past exam questions, when there are some that fit.
+PAST_EXAM_SHARE = 1 / 3
+
+log = logging.getLogger("study_deck")
 
 
 @dataclass
 class Stratum:
     id: str
     course_label: str
-    org_id: int | None  # None for a course typed in by hand (uploads only)
+    org_id: int | None  # None for a course using uploads or public past exams
     kind: str  # "course" | "module" | "topic"
     module_ids: list[int] = field(default_factory=list)
     module_labels: list[str] = field(default_factory=list)
@@ -86,6 +92,7 @@ class Question:
     answer_index: int | None = None
     answer: str | None = None
     accept: list[str] = field(default_factory=list)
+    source: str = ""  # set for a real past exam question, e.g. "Past exam · Fall 2018"
 
     @property
     def expected(self) -> str:
@@ -97,6 +104,8 @@ class Question:
         out: dict[str, Any] = {"id": self.id, "label": self.label, "type": self.type, "prompt": self.prompt}
         if self.type == "mcq":
             out["options"] = self.options
+        if self.source:
+            out["source"] = self.source
         return out
 
 
@@ -110,6 +119,8 @@ class Player:
     score: int = 0
     answered: int = 0
     uploads: int = 0
+    # Public handle for this player in the page (their id is a session secret).
+    key: str = field(default_factory=lambda: secrets.token_hex(5))
 
 
 @dataclass
@@ -126,7 +137,9 @@ class GameSession:
     cursor: int = 0
     current: Question | None = None
     card_number: int = 0
-    answers: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Players decide turns on the physical board; the host checks the card's answer.
+    outcome: dict[str, Any] | None = None
+    kicked: set[str] = field(default_factory=set)
     status: str = "lobby"  # lobby | building | ready | ended
     progress: str = ""
     notices: list[str] = field(default_factory=list)
@@ -136,6 +149,20 @@ class GameSession:
     brightspace_loaded: set[int] = field(default_factory=set)
     # Which Brightspace files each course's material came from, and how they were chosen.
     picked: dict[int, dict[str, Any]] = field(default_factory=dict)
+    # Boilerexams past exam questions per section, shown to the AI as a style guide
+    # (stratum id -> prompt text), and what to tell players (stratum id -> course code, count).
+    use_boilerexams: bool = False
+    styles: dict[str, str] = field(default_factory=dict)
+    # Public exam questions and answers can supply material when a section has no
+    # shareable Brightspace text or uploads. Keep them separate from private material.
+    exam_material: dict[str, str] = field(default_factory=dict)
+    style_info: dict[str, tuple[str, int]] = field(default_factory=dict)
+    # Real past exam questions dealt as cards: a source the app plugs in
+    # (section, how many, question ids to skip -> cards), which ones were used,
+    # and how many each section got.
+    past_exams: Callable[[Stratum, int, set[str]], Awaitable[list[dict[str, Any]]]] | None = None
+    past_used: set[str] = field(default_factory=set)
+    past_cards: dict[str, int] = field(default_factory=dict)
     rng: random.Random = field(default_factory=random.Random)
     created: float = field(default_factory=time.time)
     last_active: float = field(default_factory=time.time)
@@ -205,7 +232,8 @@ class GameSession:
         """The next slice of a stratum's material, so top-ups draw on new passages."""
         pool = self.material_for(stratum)
         if not pool:
-            return ""
+            text = self.exam_material.get(stratum.id, "")
+            return tag_source("boilerexams", text) if text else ""
         start = self.stratum_cursor.get(stratum.id, 0) % len(pool)
         parts, size, i = [], 0, start
         while size < MATERIAL_CHARS_PER_CALL:
@@ -228,9 +256,10 @@ class GameSession:
     async def generate(self, total: int) -> int:
         """Generate `total` cards split evenly across strata that have material, then add
         them to the deck in random order."""
-        active = [s for s in self.strata if self.material_for(s)]
+        active = [s for s in self.strata if self.material_for(s) or self.exam_material.get(s.id)]
         if not active:
-            raise GenerationError("No study material yet. Add notes or files, or connect Brightspace.")
+            raise GenerationError("No study material found. Choose a supported Boilerexams course or matching "
+                                  "topic with past exam questions, add notes or files, or connect Brightspace.")
         # When cards don't divide evenly, a different section gets the extra ones each time.
         turn = len(self.deck) % len(active)
         active = active[turn:] + active[:turn]
@@ -240,17 +269,39 @@ class GameSession:
             want = share + (1 if n < extra else 0)
             got: list[Question] = []
             attempts = 0
-            while len(got) < want and attempts < 4:
-                attempts += 1
-                self.progress = f"Writing cards for {stratum.label}…"
-                material = self.next_window(stratum)
-                batch = await self.generator.generate(
-                    material, stratum.label, stratum.topic, self.types,
-                    min(BATCH_SIZE, want - len(got)), self.used_prompts,
-                )
-                for q in batch:
-                    got.append(self._question(stratum, q))
-                    self.used_prompts.append(q["prompt"])
+            exam_based = not self.material_for(stratum) and bool(self.exam_material.get(stratum.id))
+
+            async def write(target: int) -> None:
+                nonlocal attempts
+                while len(got) < target and attempts < 4:
+                    attempts += 1
+                    self.progress = f"Writing cards for {stratum.label}…"
+                    material = self.next_window(stratum)
+                    batch = await self.generator.generate(
+                        material, stratum.label, stratum.topic, self.types,
+                        min(BATCH_SIZE, target - len(got)), self.used_prompts, **self._style(stratum),
+                    )
+                    for q in batch:
+                        got.append(self._question(stratum, q, exam_based=exam_based))
+                        self.used_prompts.append(q["prompt"])
+
+            # About a third can be real past exam questions. The AI writes its share first,
+            # and past exam cards are added in proportion to what it managed, so they never
+            # crowd out cards from the game's own material when that runs low.
+            planned = self._past_planned(want)
+            if exam_based:
+                # Reserve real questions first so the AI avoids copying cards that
+                # will appear in this deck, then fill the rest from the exam material.
+                got.extend(await self._past_exam_cards(stratum, planned))
+                await write(want)
+                per_stratum[stratum.id] = got[:want]
+                continue
+            await write(want - planned)
+            if planned:
+                written = len(got)
+                fair = math.ceil(written * PAST_EXAM_SHARE / (1 - PAST_EXAM_SHARE))
+                got.extend(await self._past_exam_cards(stratum, min(planned, fair)))
+                await write(want)  # if fewer past exam questions fit than planned
             per_stratum[stratum.id] = got[:want]
         # Every section gets its fair share of each batch (stratified), and the batch is
         # shuffled so the order of sections and questions is random while studying.
@@ -259,12 +310,51 @@ class GameSession:
         self.deck.extend(batch)
         return len(batch)
 
-    def _question(self, stratum: Stratum, q: dict[str, Any]) -> Question:
+    def _past_planned(self, want: int) -> int:
+        """How many of `want` cards for a section could be real past exam questions."""
+        if self.past_exams is None or "mcq" not in self.types or want < 2:
+            return 0
+        return max(1, round(want * PAST_EXAM_SHARE))
+
+    async def _past_exam_cards(self, stratum: Stratum, count: int) -> list[Question]:
+        """Up to `count` real past exam questions that fit the section (multiple choice).
+        If none can be had, the AI simply writes those cards; nothing is said about it."""
+        if self.past_exams is None or count <= 0:
+            return []
+        try:
+            found = await self.past_exams(stratum, count, set(self.past_used))
+        except Exception:  # their site being down never stops a game
+            log.info("past exam questions unavailable", exc_info=True)
+            return []
+        out = []
+        for raw in found:
+            if raw["qid"] in self.past_used:
+                continue
+            self.past_used.add(raw["qid"])
+            q = raw if raw.get("keep_order") else shuffle_options(raw, self.rng)
+            out.append(Question(
+                id=secrets.token_hex(6), stratum_id=stratum.id, label=stratum.label, type="mcq",
+                prompt=q["prompt"], explanation=q.get("explanation", ""), options=q["options"],
+                answer_index=q["answer_index"], source=q.get("source", "Past exam"),
+            ))
+            self.used_prompts.append(q["prompt"])
+        self.past_cards[stratum.id] = self.past_cards.get(stratum.id, 0) + len(out)
+        return out
+
+    def _style(self, stratum: Stratum) -> dict[str, str]:
+        """Past exam examples for this section's AI requests, if it has any."""
+        if not self.material_for(stratum) and self.exam_material.get(stratum.id):
+            return {}  # these questions are the source material, not a style-only guide
+        examples = self.styles.get(stratum.id)
+        return {"examples": examples} if examples else {}
+
+    def _question(self, stratum: Stratum, q: dict[str, Any], *, exam_based: bool = False) -> Question:
         q = shuffle_options(q, self.rng)
         return Question(
             id=secrets.token_hex(6), stratum_id=stratum.id, label=stratum.label, type=q["type"],
             prompt=q["prompt"], explanation=q.get("explanation", ""), options=q.get("options", []),
             answer_index=q.get("answer_index"), answer=q.get("answer"), accept=q.get("accept", []),
+            source="AI practice · based on Boilerexams" if exam_based else "",
         )
 
     async def write_from_new(self, stratum_id: str, chunks: list[Chunk]) -> int:
@@ -287,7 +377,7 @@ class GameSession:
         for material in windows[:NEW_MATERIAL_WINDOWS]:
             batch = await self.generator.generate(
                 material[: MATERIAL_CHARS_PER_CALL + 1500], stratum.label, stratum.topic, self.types,
-                NEW_MATERIAL_CARDS, self.used_prompts,
+                NEW_MATERIAL_CARDS, self.used_prompts, **self._style(stratum),
             )
             for q in batch[:NEW_MATERIAL_CARDS]:
                 new.append(self._question(stratum, q))
@@ -323,34 +413,44 @@ class GameSession:
 
     # ----------------------------------------------------------------- gameplay
 
+    def player_by_key(self, key: Any) -> Player | None:
+        return next((p for p in self.players.values() if p.key == key), None)
+
     def draw(self) -> Question | None:
         if self.cursor >= len(self.deck):
             return None
         self.current = self.deck[self.cursor]
         self.cursor += 1
         self.card_number += 1
-        self.answers = {}
+        self.outcome = None
         return self.current
 
-    def submit(self, player_id: str, question_id: str, given: Any, skipped: bool = False) -> dict[str, Any]:
-        """Record a player's answer. skipped=True is "I don't know": it counts as a miss."""
+    def submit(self, question_id: str, given: Any, skipped: bool = False) -> dict[str, Any]:
+        """Check the host-entered answer without assigning a player or awarding points."""
         q = self.current
         if q is None or q.id != question_id:
             raise ValueError("That card is no longer in play.")
-        if player_id in self.answers:
-            raise ValueError("You already answered this card.")
+        if self.outcome is not None:
+            raise ValueError("This card has already been answered.")
         correct = False if skipped else check_answer(q, given)
-        player = self.players[player_id]
-        player.answered += 1
-        player.score += int(correct)
         if skipped:
             shown = ""
         elif q.type == "mcq" and str(given).isdigit() and int(given) < len(q.options):
             shown = q.options[int(given)]
         else:
             shown = str(given)
-        self.answers[player_id] = {"correct": correct, "given": shown[:80], "skipped": skipped}
+        self.outcome = {"correct": correct, "given": shown[:80], "skipped": skipped}
         return {"correct": correct, "expected": q.expected, "explanation": q.explanation}
+
+    def remove_player(self, player_id: str, *, kicked: bool = False) -> None:
+        """A player leaves, or the host removes them (kicked: they can't rejoin this
+        game). Their own uploads and notes leave with them."""
+        if player_id == self.host_id or player_id not in self.players:
+            raise ValueError("That player can't be removed.")
+        del self.players[player_id]
+        if kicked:
+            self.kicked.add(player_id)
+        self.chunks = [c for c in self.chunks if c.contributor != player_id or c.source == "brightspace"]
 
 
 # -------------------------------------------------------------------- answers

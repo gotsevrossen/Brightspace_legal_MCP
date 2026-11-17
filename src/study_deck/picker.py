@@ -5,8 +5,8 @@ top-level folder alone says little. When a section is a typed topic, or the
 chosen folders hold more files than one deck reads, the AI sees an outline of
 folder and file TITLES (never file contents, names of people, or grades) and
 picks which folders to open, at any depth, and which single files to read.
-Without an AI that can pick (offline demo generator) or when its reply is
-unusable, titles are matched against the topics instead.
+When the AI can't pick or its reply is unusable, titles are matched against
+the topics instead.
 """
 
 from __future__ import annotations

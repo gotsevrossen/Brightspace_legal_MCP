@@ -10,12 +10,13 @@ computer without a Purdue OAuth client: Study Deck runs in a browser window the
 app opens, they sign in themselves in a new tab of that window, and the app uses
 that in-memory session for the same read-only routes.
 
-Demo mode serves built-in sample courses so the game can be tried without any
-Purdue access. It never falls back to passwords or page scraping.
+Without either, players use their own uploaded files and notes. It never falls
+back to passwords or page scraping.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -24,7 +25,7 @@ import re
 import secrets
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Protocol
 from urllib.parse import urlencode, urlsplit
 
@@ -207,8 +208,9 @@ class TokenTransport:
 
 
 class BrowserTransport:
-    """Personal sign-in mode: the user's own Brightspace session, for one person
-    running Study Deck on their own computer (opt-in, see STUDY_DECK.md).
+    """Personal sign-in mode: the user's own Brightspace session, for the person
+    running Study Deck on their own computer (opt-in, see STUDY_DECK.md). Other
+    players sign in through GuestTransport, in private windows of the same browser.
 
     Study Deck runs in a browser window this app opens (the default browser,
     Chrome or Edge). Connect
@@ -220,6 +222,8 @@ class BrowserTransport:
     window, since the game runs in it. After sign-in only the same allowlisted,
     read-only, rate-limited API routes as OAuth mode are called.
     """
+
+    poll_seconds = 1.0  # how often a sign-in tab is checked
 
     @staticmethod
     def channels() -> tuple[str | None, ...]:
@@ -312,39 +316,73 @@ class BrowserTransport:
 
     async def sign_in(self, timeout: float = 300.0) -> None:
         """Open Purdue's sign-in as a new tab in the Study Deck window and wait."""
+        await self.open()
+        await self._sign_in_tab(f"{self.base_url}/d2l/home", timeout)
+        for page in self.app_pages()[:1]:
+            await page.bring_to_front()
+
+    async def _sign_in_tab(self, start_url: str, timeout: float) -> None:
+        """Open a tab at start_url, wait until it's signed in to Brightspace, close it."""
         from purdue_brightspace_mcp.auth.browser import is_signed_in_url  # noqa: PLC0415
 
-        await self.open()
         self.signed_in = False
         tab = await self._context.new_page()
-        await tab.goto(f"{self.base_url}/d2l/home")
+        await tab.goto(start_url)
         await tab.bring_to_front()
+        # The address alone isn't proof: on the way to Purdue's login page the tab
+        # passes through /d2l/home before Brightspace redirects it. So each time the
+        # tab lands on a new Brightspace page, ask Brightspace whether it's signed in.
+        # Asked again when the address changes, or every few seconds while it stays put.
+        deadline = time.monotonic() + timeout
+        checked, checked_at = "", 0.0
         try:
-            await tab.wait_for_url(is_signed_in_url, timeout=timeout * 1000)
-        except Exception as exc:
-            closed = tab.is_closed()
-            if not closed:
+            while True:
+                if tab.is_closed():
+                    raise AuthRequired("The sign-in tab was closed before you finished.")
+                if time.monotonic() > deadline:
+                    raise AuthRequired("Sign-in was not completed in time.")
+                url = tab.url
+                if is_signed_in_url(url) and (url != checked or time.monotonic() - checked_at > 5):
+                    checked, checked_at = url, time.monotonic()
+                    if await self._session_ok():
+                        break
+                await asyncio.sleep(self.poll_seconds)
+        except BaseException:
+            if not tab.is_closed():
                 try:
                     await tab.close()
                 except Exception:
                     pass
-            raise AuthRequired("The sign-in tab was closed before you finished." if closed
-                               else "Sign-in was not completed in time.") from exc
+            raise
         self.signed_in = True
         try:
             await tab.close()
         except Exception:
             pass
-        for page in self.app_pages()[:1]:
-            await page.bring_to_front()
 
-    async def _get(self, url: str) -> Any:
+    async def _session_ok(self) -> bool:
+        """Brightspace confirms this window is signed in (only the status is read)."""
+        try:
+            resp = await self._context.request.get(f"{self.base_url}/d2l/api/lp/1.0/users/whoami",
+                                                   max_redirects=0, fail_on_status_code=False)
+            return resp.status == 200
+        except Exception:
+            return False
+
+    async def _get(self, url: str, method: str = "GET") -> Any:
         if not self.signed_in:
             raise AuthRequired("Not signed in. Connect Brightspace again.")
         if not self.is_open:
             raise AuthRequired("The Study Deck window was closed, which ended the Brightspace session. "
                                "Connect Brightspace again.")
-        resp = await self._context.request.get(url, max_redirects=0, fail_on_status_code=False)
+        try:
+            resp = await self._context.request.fetch(url, method=method, max_redirects=0,
+                                                     fail_on_status_code=False, timeout=120_000)
+        except Exception:
+            # A timeout or network error. Playwright's message lists the request's
+            # headers, session cookies included, so it's dropped here (from None),
+            # never logged or shown.
+            raise BrightspaceHTTPError(0, urlsplit(url).path) from None
         if resp.status in (301, 302, 303, 307, 308, 401, 403):
             raise AuthRequired(f"Brightspace refused the request (HTTP {resp.status}). Connect Brightspace again.")
         if resp.status >= 400:
@@ -359,10 +397,20 @@ class BrowserTransport:
             raise BrightspaceHTTPError(resp.status, urlsplit(url).path) from exc
 
     async def get_bytes(self, url: str, max_bytes: int) -> tuple[bytes, str]:
+        # The browser downloads a whole response before it can be checked, so ask for
+        # the size first and skip big files (lecture videos, narrated slides) unread.
+        too_big = UnsupportedFile("A course file is larger than the 15 MB limit and was skipped.")
+        try:
+            head = await self._get(url, method="HEAD")
+            length = head.headers.get("content-length")
+            if length and length.isdigit() and int(length) > max_bytes:
+                raise too_big
+        except (BrightspaceHTTPError, AuthRequired):
+            pass  # HEAD isn't answered for this file; the download below still checks
         resp = await self._get(url)
         length = resp.headers.get("content-length")
         if length and length.isdigit() and int(length) > max_bytes:
-            raise UnsupportedFile("A course file is larger than the 15 MB limit and was skipped.")
+            raise too_big
         data = await resp.body()
         if len(data) > max_bytes:
             raise UnsupportedFile("A course file is larger than the 15 MB limit and was skipped.")
@@ -387,6 +435,57 @@ class BrowserTransport:
                 except Exception:
                     pass
         self._pw = self._browser = self._context = None
+
+
+class GuestTransport(BrowserTransport):
+    """Personal sign-in for another player in the game (someone on a phone).
+
+    Purdue only lets people sign in on its own page in a real browser, and the
+    browser Study Deck controls is on the host's computer, so the player signs in
+    there: in a private window of that browser with its own cookies, so their
+    session is never mixed with the host's or anyone else's. The window starts on
+    a Study Deck page naming the player, so the right person signs in to it.
+    Like the host's session it lives in memory only and ends when they
+    disconnect or the server stops.
+    """
+
+    def __init__(self, window: BrowserTransport) -> None:
+        super().__init__(window.base_url, window.app_url)
+        self.window = window
+
+    @property
+    def is_open(self) -> bool:
+        return self._context is not None and self.window.is_open
+
+    async def open(self) -> None:
+        if self.is_open:
+            return
+        await self.window.open()
+        self._context = await self.window._browser.new_context(no_viewport=True)
+
+    def app_pages(self) -> list[Any]:
+        return []
+
+    async def sign_in(self, timeout: float = 300.0, intro_url: str | None = None) -> None:
+        await self.open()
+        try:
+            await self._sign_in_tab(intro_url or f"{self.base_url}/d2l/home", timeout)
+        except Exception:
+            await self.close()
+            raise
+
+    async def close(self) -> None:
+        """Disconnect: close this player's private window and forget its cookies."""
+        self.signed_in = False
+        context, self._context = self._context, None
+        if context is not None:
+            try:
+                await context.close()
+            except Exception:
+                pass
+
+    async def shutdown(self) -> None:
+        await self.close()
 
 
 # ---------------------------------------------------------------------- live source
@@ -495,101 +594,3 @@ class LiveSource:
 
     async def close(self) -> None:
         await self.client.close()
-
-
-# ---------------------------------------------------------------------- demo source
-
-
-@dataclass
-class _DemoModule:
-    id: int
-    title: str
-    topics: list[tuple[str, str]] = field(default_factory=list)
-    children: list["_DemoModule"] = field(default_factory=list)
-
-
-_DEMO: dict[int, tuple[Course, list[_DemoModule]]] = {
-    900101: (
-        Course(900101, "BIOL 1100 · Cell Biology (sample)", "BIOL1100-SAMPLE"),
-        [
-            _DemoModule(1, "Week 1 · Cells and organelles", [
-                ("Lecture 1 slides", "The cell is the basic unit of life. Prokaryotic cells lack a nucleus, while eukaryotic cells keep their DNA inside a membrane-bound nucleus. The plasma membrane is a phospholipid bilayer that controls what enters and leaves the cell. Ribosomes are the site of protein synthesis and are found in both prokaryotic and eukaryotic cells.\n\nThe mitochondrion produces most of the cell's ATP through cellular respiration. The endoplasmic reticulum comes in two forms: rough endoplasmic reticulum is studded with ribosomes and folds proteins, while smooth endoplasmic reticulum makes lipids and detoxifies chemicals. The Golgi apparatus modifies, sorts and packages proteins for transport. Lysosomes contain digestive enzymes that break down worn-out organelles."),
-                ("Quiz 1 answer key", "This assessment file is excluded automatically."),
-            ]),
-            _DemoModule(2, "Week 2 · Photosynthesis", [
-                ("Lecture 2 notes", "Photosynthesis converts light energy into chemical energy stored in glucose. It takes place in the chloroplast, an organelle found in plant cells and algae. The light-dependent reactions occur in the thylakoid membranes and produce ATP and NADPH while splitting water and releasing oxygen.\n\nThe Calvin cycle takes place in the stroma and uses ATP and NADPH to fix carbon dioxide into sugar. The enzyme rubisco catalyzes the first step of carbon fixation. Chlorophyll is the green pigment that absorbs mostly red and blue light and reflects green light."),
-            ]),
-            _DemoModule(3, "Week 3 · Cellular respiration", [
-                ("Lecture 3 slides", "Cellular respiration breaks down glucose to release energy as ATP. Glycolysis happens in the cytoplasm and splits one glucose molecule into two molecules of pyruvate. The citric acid cycle, also called the Krebs cycle, runs in the mitochondrial matrix and releases carbon dioxide.\n\nThe electron transport chain sits in the inner mitochondrial membrane and produces most of the ATP through oxidative phosphorylation. Oxygen is the final electron acceptor and combines with hydrogen to form water. Without oxygen, cells rely on fermentation, which regenerates NAD+ but yields far less ATP."),
-            ]),
-        ],
-    ),
-    900202: (
-        Course(900202, "CS 1800 · Problem Solving and Programming (sample)", "CS1800-SAMPLE"),
-        [
-            _DemoModule(11, "Unit 1 · Algorithms and complexity", [
-                ("Unit 1 reading", "An algorithm is a finite sequence of well-defined steps that solves a problem. Big-O notation describes how an algorithm's running time grows as the input size grows. Linear search checks each element in turn and runs in linear time, while binary search repeatedly halves a sorted list and runs in logarithmic time.\n\nSelection sort and insertion sort run in quadratic time in the worst case. Merge sort divides the list in half, sorts each half recursively and merges the results, giving a running time of n log n. A stable sorting algorithm keeps equal elements in their original relative order."),
-            ]),
-            _DemoModule(12, "Unit 2 · Recursion", [
-                ("Unit 2 slides", "Recursion is a technique where a method solves a problem by calling itself on a smaller instance of the same problem. Every recursive method needs a base case that stops the recursion; without one, the calls continue until the program runs out of stack space and throws a stack overflow error.\n\nEach recursive call gets its own frame on the call stack with its own copies of local variables. Tail recursion is when the recursive call is the last operation in the method. The factorial function and the Fibonacci sequence are classic examples of recursion, and memoization stores earlier results so repeated subproblems are not recomputed."),
-            ]),
-            _DemoModule(13, "Unit 3 · Data structures", children=[
-                _DemoModule(131, "Lists, stacks and queues", [
-                    ("Linear structures notes", "An array stores elements in contiguous memory and allows constant-time access by index. A linked list stores elements in nodes that each point to the next node, which makes insertion at the front fast but access by index slow. A stack is a last-in, first-out structure with push and pop operations.\n\nA queue is a first-in, first-out structure where elements are added at the rear and removed from the front. A deque allows insertion and removal at both ends, and a circular buffer reuses a fixed-size array for a queue by wrapping its indexes around."),
-                ]),
-                _DemoModule(132, "Hash tables and trees", [
-                    ("Hashing and trees notes", "A hash table maps keys to values using a hash function and offers average constant-time lookup. Two keys that hash to the same slot cause a collision, which chaining resolves by keeping a list in each slot. A binary search tree keeps smaller keys in the left subtree and larger keys in the right subtree.\n\nA balanced binary search tree such as an AVL tree keeps its height logarithmic, so search, insertion and deletion stay fast. A heap is a complete binary tree where each parent is at least as large as its children, which makes it a good priority queue."),
-                ]),
-            ]),
-        ],
-    ),
-}
-
-
-class DemoSource:
-    """Sample courses for demo mode. Every demo player is 'enrolled' in both."""
-
-    kind = "demo"
-
-    async def courses(self) -> list[Course]:
-        return [course for course, _ in _DEMO.values()]
-
-    @staticmethod
-    def _walk(mods: list[_DemoModule], path: tuple[_DemoModule, ...] = ()):
-        for m in mods:
-            yield m, (*path, m)
-            yield from DemoSource._walk(m.children, (*path, m))
-
-    @staticmethod
-    def _count(m: _DemoModule) -> int:
-        return sum(1 for t, _ in m.topics if not ASSESSMENT_TITLE.search(t)) + sum(
-            DemoSource._count(c) for c in m.children)
-
-    async def modules(self, org_id: int) -> list[Module]:
-        _, modules = _DEMO.get(org_id, (None, []))
-        return [Module(m.id, m.title, self._count(m), len(path) - 1, path[-2].id if len(path) > 1 else None,
-                       tuple(x.title for x in path))
-                for m, path in self._walk(modules) if self._count(m)]
-
-    async def files(self, org_id: int, module_ids: list[int] | None) -> list[FileRef]:
-        _, modules = _DEMO.get(org_id, (None, []))
-        wanted = set(module_ids or [])
-        return [
-            FileRef(m.id * 100 + n, title, tuple(x.id for x in path), tuple(x.title for x in path), title)
-            for m, path in self._walk(modules)
-            if not wanted or any(x.id in wanted for x in path)
-            for n, (title, _) in enumerate(m.topics)
-            if not ASSESSMENT_TITLE.search(title)
-        ]
-
-    async def read(self, org_id: int, files: list[FileRef]) -> list[MaterialPiece]:
-        _, modules = _DEMO.get(org_id, (None, []))
-        texts = {m.id * 100 + n: text for m, _ in self._walk(modules) for n, (_, text) in enumerate(m.topics)}
-        return [MaterialPiece(texts[f.topic_id], f.path[0], f.path_titles[0], f.title, f.path)
-                for f in files if f.topic_id in texts]
-
-    async def material(self, org_id: int, module_ids: list[int] | None) -> list[MaterialPiece]:
-        return await self.read(org_id, await self.files(org_id, module_ids))
-
-    async def close(self) -> None:
-        pass

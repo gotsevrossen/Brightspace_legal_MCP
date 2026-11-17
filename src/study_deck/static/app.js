@@ -83,8 +83,7 @@ let me = null;
 async function loadMe() {
   me = await api("/api/me");
   const bs = me.brightspace;
-  topRight.innerHTML = `${me.demo_mode ? '<span class="pill gold">Demo mode</span>' : ""}
-    <span class="pill"><span class="dot ${bs.connected ? "on" : ""}"></span>${bs.connected ? `Brightspace · ${bs.courses} course${bs.courses === 1 ? "" : "s"}` : "Brightspace not connected"}</span>
+  topRight.innerHTML = `${bs.available ? `<span class="pill"><span class="dot ${bs.connected ? "on" : ""}"></span>${bs.connected ? `Brightspace · ${bs.courses} course${bs.courses === 1 ? "" : "s"}` : "Brightspace not connected"}</span>` : ""}
     <a class="pill pill-link" href="#/settings">${ICON.gear}Settings</a>`;
   return me;
 }
@@ -97,6 +96,9 @@ async function route() {
   const hash = location.hash || "#/";
   if (hash === "#connected") { history.replaceState(null, "", "#/"); toast("Brightspace connected."); }
   if (hash === "#signin-failed") { history.replaceState(null, "", "#/"); toast("Brightspace sign-in didn't finish. Try again.", true); }
+  if (hash === "#signin-unavailable") { history.replaceState(null, "", "#/"); toast("Brightspace isn't set up on this server. Add your own notes and files instead.", true); }
+  if (hash === "#signin-join-first") { history.replaceState(null, "", "#/"); toast("Join a game first, then connect Brightspace from the game page.", true); }
+  if (hash === "#signin-busy") { history.replaceState(null, "", "#/"); toast("Too many people are signing in right now. Try again in a minute.", true); }
   if (hash === "#signin-local-only") { history.replaceState(null, "", "#/"); toast("Brightspace can only be connected on the computer running Study Deck.", true); }
   try {
     await loadMe();
@@ -121,7 +123,9 @@ const IN_APP_WINDOW = navigator.webdriver === true;
 let signInTimer = null;
 function watchSignIn() {
   if (!me.brightspace.signing_in || signInTimer) return;
-  toast(IN_APP_WINDOW ? "Finish signing in to Purdue in the new tab. It closes by itself when you're done."
+  toast(me.brightspace.signin_on_host
+    ? "A Purdue sign-in window with your name opened on the computer running Study Deck. Sign in there; this page connects by itself."
+    : IN_APP_WINDOW ? "Finish signing in to Purdue in the new tab. It closes by itself when you're done."
     : "Sign in to Purdue in the Study Deck window that opened (it may be behind this one). This page connects by itself.");
   signInTimer = setInterval(async () => {
     try { await loadMe(); } catch { return; }
@@ -139,6 +143,7 @@ function watchSignIn() {
 /* Small Brightspace status bar on the home page; the details live in Settings. */
 function connectCard() {
   const bs = me.brightspace;
+  if (!bs.available) return "";
   const bar = (dot, title, sub, action) => `<section class="card tight bs-card">
     <div class="bs-line"><span class="dot ${dot}" aria-hidden="true"></span>
       <div class="bs-text"><b>${title}</b>${sub ? `<span class="hint">${sub}</span>` : ""}</div>${action}</div>
@@ -148,10 +153,21 @@ function connectCard() {
       '<button class="btn line sm" id="disconnect" type="button">Disconnect</button>');
   }
   if (bs.signing_in) {
-    return bar("wait", "Signing in to Brightspace…", IN_APP_WINDOW ? "Finish in the Purdue tab" : "Finish in the Study Deck window", "");
+    return bar("wait", "Signing in to Brightspace…", bs.signin_on_host ? "Finish on the computer running Study Deck"
+      : IN_APP_WINDOW ? "Finish in the Purdue tab" : "Finish in the Study Deck window", "");
   }
+  if (bs.signin_on_host) {
+    return bar("", "Brightspace not connected", "Join a game first, then connect from the game page", "");
+  }
+  if (!bs.can_connect) return bar("", "Brightspace not connected", "It can only be connected on the computer running Study Deck", "");
   return bar("", "Brightspace not connected", "",
-    `<a class="btn dark sm" href="/auth/brightspace/start">${me.demo_mode ? "Load samples" : "Connect"}</a>`);
+    '<a class="btn dark sm" href="/auth/brightspace/start">Connect</a>');
+}
+
+/* On the computer running Study Deck, say where everyone else should go. */
+function inviteNotice() {
+  if (!me.on_network || me.join_base === location.origin) return "";
+  return `<div class="notice invite">${ICON.info}<p class="small">Players on the same Wi-Fi open <b class="url">${esc(me.join_base)}</b> on their phone or laptop, or scan the QR code once you start a game.</p></div>`;
 }
 
 function homeView(prefill) {
@@ -161,7 +177,7 @@ function homeView(prefill) {
       <h1>Study<br>Deck</h1>
       <p class="lede">Pick what you're studying, pool course material and notes with your group, and play with a deck of questions that keeps refilling itself.</p>
     </section>
-    ${me.demo_mode ? `<div class="notice demo">${ICON.info}<p class="small"><b>Demo mode.</b> Sample courses${me.genai.offline_demo ? " and a simple offline card writer" : ""}. Real games use Purdue Brightspace and Purdue GenAI Studio once they're set up.</p></div>` : ""}
+    ${inviteNotice()}
     <div class="grid g2">
       <div class="grid">
         <section class="card lead">
@@ -174,7 +190,7 @@ function homeView(prefill) {
       <section class="card">
         <p class="eyebrow">Player</p><h2>Join a game</h2>
         <form id="joinForm" class="grid" novalidate>
-          <label class="f">Join code<input class="input code-input" name="code" maxlength="6" autocomplete="off" autocapitalize="characters" spellcheck="false" value="${esc(prefill)}" required></label>
+          <label class="f">Join code<input class="input code-input" name="code" maxlength="6" autocomplete="off" autocapitalize="characters" spellcheck="false" value="${esc(prefill.toUpperCase())}" required></label>
           <label class="f">Your first name<input class="input" name="name" maxlength="24" autocomplete="given-name" value="${esc(me.name)}" required></label>
           <button class="btn gold wide" type="submit">Join</button>
         </form>
@@ -190,6 +206,8 @@ function homeView(prefill) {
       location.hash = `#/game/${code}`;
     });
   });
+  // Arrived from a join link or QR code: the code is filled in, so go straight to the name.
+  if (prefill) { const n = $("#joinForm").name; if (!n.value) n.focus(); }
   const dc = $("#disconnect");
   if (dc) dc.addEventListener("click", () => guarded(dc, async () => { await api("/api/brightspace/disconnect", { method: "POST" }); route(); }));
 }
@@ -270,24 +288,69 @@ function settingsView() {
 
 /* -------------------------------------------------------------------- host */
 
-const setup = { entries: [], types: "both", size: 20 };
+const setup = { entries: [], types: "both", size: 20, boilerexams: true };
+
+// Boilerexams courses, so matching courses can be marked; fetched once, in the background.
+let boilerexams = null;
+function loadBoilerexams() {
+  if (boilerexams && !boilerexams.unreachable) return;
+  boilerexams = { enabled: false, courses: [], loading: true };
+  api("/api/boilerexams").then((r) => { boilerexams = r; renderBlocks(); }).catch(() => {
+    boilerexams = { enabled: true, courses: [], unreachable: true };
+    renderStyleOption();
+  });
+}
+// Same rule as the server: "MA 16100" or "MA 161" -> "MA16100".
+function courseCodes(name) {
+  return [...name.toUpperCase().matchAll(/\b([A-Z]{2,5})\s?(\d{3,5})\b/g)]
+    .map(([, s, n]) => (n.length === 3 ? `${s}${n}00` : n.length === 5 ? `${s}${n}` : null)).filter(Boolean);
+}
+const spacedCode = (code) => code.replace(/^([A-Z]+)/, "$1 ");
+function onBoilerexams(name) {
+  return boilerexams && boilerexams.courses.length ? courseCodes(name).find((c) => boilerexams.courses.includes(c)) || null : null;
+}
+function renderStyleOption() {
+  const el = $("#styleOption");
+  if (!el) return;
+  if (setup.entries.some((e) => courseCodes(e.name).length)) {
+    if (!boilerexams || boilerexams.loading) {
+      el.innerHTML = '<p class="hint" role="status">Checking for past exam questions on Boilerexams…</p>';
+      return;
+    }
+    if (boilerexams.unreachable) {
+      el.innerHTML = '<p class="hint" role="status">Could not check Boilerexams right now. Your course is still added. <button type="button" class="linkbtn" id="retryBoilerexams">Try again</button></p>';
+      $("#retryBoilerexams", el).addEventListener("click", () => { loadBoilerexams(); renderStyleOption(); });
+      return;
+    }
+  }
+  // Only offered when a chosen course is on Boilerexams; otherwise nothing is said about it.
+  const matched = boilerexams && boilerexams.enabled
+    ? [...new Set(setup.entries.map((e) => onBoilerexams(e.name)).filter(Boolean))] : [];
+  if (!matched.length) { el.innerHTML = ""; return; }
+  el.innerHTML = `<label class="check"><input type="checkbox" id="bxIn" ${setup.boilerexams ? "checked" : ""}>
+    <span><b>Use past exam questions</b> · ${esc(matched.map(spacedCode).join(", "))} ${matched.length === 1 ? "is" : "are"} on Boilerexams. Multiple-choice decks include real past exam questions. The AI uses your material when available; otherwise it creates new practice from matching past exam questions and answers. Text-only questions.</span></label>`;
+  $("#bxIn", el).addEventListener("change", (ev) => { setup.boilerexams = ev.target.checked; renderBlocks(); });
+}
 
 async function hostView() {
+  Object.assign(setup, { entries: [], types: "both", size: 20, boilerexams: true });
   const { courses } = await api("/api/courses");
   setup.courses = courses;
-  setup.entries = setup.entries.filter((e) => !e.key || courses.some((c) => c.key === e.key));
+  loadBoilerexams();
   main.innerHTML = `
     <section>
       <p class="eyebrow">Host a game</p>
       <h1>What are you<br>studying?</h1>
-      <p class="lede">Pick one or more courses. For each, study the whole course, chosen modules, or specific topics. The deck is dealt evenly across every module and topic you pick.</p>
+      <p class="lede">Pick a Brightspace course or add a course below. If it is on Boilerexams, past exam questions can supply the material without notes or uploads. Study a whole course or focus on topics.</p>
     </section>
     <section class="card step">
       <h2><span class="step-num">1</span>Courses</h2>
       ${courses.length ? `<div class="chips" id="courseChips">${courses.map((c) => `<button type="button" class="chip" data-key="${esc(c.key)}" aria-pressed="${setup.entries.some((e) => e.key === c.key)}"><span class="tick">${ICON.check}</span>${esc(c.name)}</button>`).join("")}</div>`
-        : `<div class="notice">${ICON.info}<p class="small">No Brightspace courses connected. <a href="/auth/brightspace/start">${me.demo_mode ? "Load sample courses" : "Connect Brightspace"}</a>, or add a course below and use your own notes and files.</p></div>`}
+        : me.brightspace.can_connect
+          ? `<div class="notice">${ICON.info}<p class="small">No Brightspace courses connected. Add a course below to use available past exams or your own material, or <a href="/auth/brightspace/start">connect Brightspace</a>.</p></div>`
+          : `<p class="muted small">Add your course code. Available Boilerexams questions can supply the material, and everyone can add notes and files.</p>`}
       <form id="manualForm" class="row grow-first" novalidate>
-        <input class="input" name="manual" maxlength="60" placeholder="Course not on Brightspace, e.g. PSY 1200" aria-label="Course name for your own material">
+        <input class="input" name="manual" maxlength="60" placeholder="Course name or code, e.g. PHYS 17200" aria-label="Course name or code">
         <button class="btn line" type="submit">Add course</button>
       </form>
       <div id="blocks" class="grid"></div>
@@ -299,13 +362,14 @@ async function hostView() {
         <div class="grid"><label for="sizeIn"><b>Starting deck</b></label><div class="stepper"><button type="button" data-step="-1" aria-label="Fewer cards">−</button><input id="sizeIn" type="number" inputmode="numeric" min="1" max="${esc(me.max_deck_size)}" step="1" value="${esc(setup.size)}" aria-describedby="sizeHint"><button type="button" data-step="1" aria-label="More cards">+</button></div><span class="hint" id="sizeHint">Type any number of cards, 1 to ${esc(me.max_deck_size)}.</span></div>
       </div>
       <p class="hint">When the deck runs low, new questions are written automatically from the same sections.</p>
+      <div id="styleOption"></div>
     </section>
     <section class="card step">
       <h2><span class="step-num">3</span>Start</h2>
       <label class="f">Your first name<input class="input" id="hostName" maxlength="24" autocomplete="given-name" value="${esc(me.name)}"></label>
       ${me.genai.configured
-        ? `<div class="notice demo">${ICON.info}<p class="small">Cards will be written by <b>Purdue GenAI Studio</b> using <b>${esc(me.genai.model)}</b>. <a href="#/settings">Change in Settings</a></p></div>`
-        : `<div class="notice">${ICON.info}<p class="small">${me.genai.offline_demo ? "Cards will be written by the simple offline demo writer. For real AI questions, " : "To write questions, "}<a href="#/settings">add your Purdue GenAI Studio key in Settings</a>.</p></div>`}
+        ? `<div class="notice good">${ICON.info}<p class="small">Cards will be written by <b>Purdue GenAI Studio</b> using <b>${esc(me.genai.model)}</b>. <a href="#/settings">Change in Settings</a></p></div>`
+        : `<div class="notice">${ICON.alert}<p class="small">Cards are written by Purdue GenAI Studio. <a href="#/settings">Add your API key in Settings</a> before you create the game.</p></div>`}
       <div id="permissions" class="grid"></div>
       <button class="btn gold big wide" id="createBtn" type="button">Create game</button>
     </section>`;
@@ -322,8 +386,9 @@ async function hostView() {
     e.preventDefault();
     const name = e.currentTarget.manual.value.trim();
     if (!name) return;
-    setup.entries.push({ key: null, name, kind: "topic", picked: new Set(), topics: "" });
+    setup.entries.push({ key: null, name, kind: "course", picked: new Set(), topics: "" });
     e.currentTarget.manual.value = "";
+    loadBoilerexams();
     renderBlocks();
   });
   initSeg($('[data-seg="types"]'), (v) => { setup.types = v; });
@@ -342,10 +407,11 @@ async function hostView() {
 async function renderBlocks() {
   const blocks = $("#blocks");
   if (!blocks) return;
-  if (!setup.entries.length) { blocks.innerHTML = '<p class="muted small">Pick a course above to choose what to study in it.</p>'; renderPermissions(); return; }
+  renderStyleOption();
+  if (!setup.entries.length) { blocks.innerHTML = `<p class="muted small">${setup.courses && setup.courses.length ? "Pick" : "Add"} a course above to choose what to study in it.</p>`; renderPermissions(); return; }
   blocks.innerHTML = setup.entries.map((e, i) => `
     <div class="course-block" data-i="${i}">
-      <header><div><span class="tag">${e.key ? "Brightspace course" : "Your material only"}</span><h3>${esc(e.name)}</h3></div>
+      <header><div><span class="tag">${e.key ? "Brightspace course" : setup.boilerexams && onBoilerexams(e.name) ? "Boilerexams + optional uploads" : "Your material only"}</span>${onBoilerexams(e.name) ? ' <span class="tag bx">On Boilerexams</span>' : ""}<h3>${esc(e.name)}</h3></div>
         <button type="button" class="linkbtn small" data-remove="${i}">Remove</button></header>
       ${segHTML(`kind${i}`, e.key ? [["course", "Whole course"], ["module", "Modules"], ["topic", "Topics"]] : [["course", "Whole course"], ["topic", "Topics"]], e.kind, `What to study in ${e.name}`)}
       <div class="kind-body"></div>
@@ -367,7 +433,7 @@ async function renderBlocks() {
 async function renderKind(e, block) {
   const body = $(".kind-body", block);
   if (e.kind === "course") {
-    body.innerHTML = `<p class="muted small">${e.key ? "Files from every folder, at any depth, plus anything players add. If the course has more files than a deck reads at once, the AI picks a spread across its folders." : "Whatever notes and files players add for this course."}</p>`;
+    body.innerHTML = `<p class="muted small">${e.key ? "Files from every folder, at any depth, plus anything players add. If the course has more files than a deck reads at once, the AI picks a spread across its folders." : setup.boilerexams && onBoilerexams(e.name) ? "Build from past exam questions and new AI practice based on their concepts and correct answers. Notes and files are optional; when added, they supply the AI's material instead." : "Whatever notes and files players add for this course."}</p>`;
   } else if (e.kind === "topic") {
     body.innerHTML = `<label class="f">Topics<input class="input" maxlength="200" placeholder="e.g. glycolysis, electron transport chain" value="${esc(e.topics)}"><span class="hint">Separate topics with commas. Each one becomes its own section of the deck.${e.key ? " The AI looks through every folder, however deep, and picks the files that match your topics. It only sees folder and file titles to do that." : ""}</span></label>`;
     $("input", body).addEventListener("input", (ev) => { e.topics = ev.target.value; });
@@ -502,6 +568,7 @@ async function createGame() {
       deck_size: setup.size,
       ai_permission_courses: setup.entries.filter((e) => e.key && e.permitted).map((e) => e.key),
       genai_key: keyInput ? keyInput.value : "",
+      boilerexams: setup.boilerexams,
     },
   });
   if (keyInput) keyInput.value = "";
@@ -528,8 +595,9 @@ async function gameView(code) {
     try { render(await api(`/api/sessions/${code}`)); }
     catch (e) {
       stopPolling();
-      main.innerHTML = `<section class="card"><h2>Game unavailable</h2><p class="muted">${esc(e.message)}</p>
-        <div class="btn-row"><a class="btn dark" href="#/join/${esc(code)}">Join this game</a><a class="btn line" href="#/">Back to start</a></div></section>`;
+      const removed = /removed you/.test(e.message); // the host removed them: rejoining isn't possible
+      main.innerHTML = `<section class="card"><h2>${removed ? "You were removed" : "Game unavailable"}</h2><p class="muted">${esc(e.message)}</p>
+        <div class="btn-row">${removed ? "" : `<a class="btn dark" href="#/join/${esc(code)}">Join this game</a>`}<a class="btn ${removed ? "dark" : "line"}" href="#/">Back to start</a></div></section>`;
     }
   };
   await tick();
@@ -556,8 +624,8 @@ function render(s) {
   patch("r-head", headHTML(s));
   patch("r-notices", noticesHTML(s));
   patch("r-sections", sectionsHTML(s));
-  patch("r-players", playersHTML(s));
-  patch("r-picked", s.picked && s.picked.length ? `<section class="card tight"><p class="eyebrow">Brightspace files in this deck</p>${s.picked.map(pickedHTML).join("")}</section>` : "");
+  patch("r-players", playersHTML(s), bindPlayers);
+  patch("r-picked", (s.picked && s.picked.length ? `<section class="card tight"><p class="eyebrow">Brightspace files in this deck</p>${s.picked.map(pickedHTML).join("")}</section>` : "") + styleHTML(s));
   patch("r-host", hostHTML(s), bindHost);
   patch("r-upload", uploadHTML(s), bindUpload);
   patch("r-card", cardHTML(s), bindCard);
@@ -566,16 +634,22 @@ function render(s) {
 
 function headHTML(s) {
   const status = { lobby: "Gathering material", building: "Building the deck", ready: "In play" }[s.status] || s.status;
-  return `<section class="card lead">
-    <div class="spread">
+  const site = me.join_base.replace(/^https?:\/\//, "");
+  const lobby = s.status !== "ready";
+  const info = `<section class="card lead head-main">
+    <div class="grid">
       <div><p class="eyebrow">Join code</p><div class="code" aria-label="Join code ${esc(s.code.split("").join(" "))}">${esc(s.code)}</div></div>
-      <div class="grid end-items">
+      <div class="grid start-items">
         <span class="pill ink">${esc(status)}</span>
         <span class="small muted">${esc(s.players.length)} player${s.players.length === 1 ? "" : "s"} · ${esc(s.types.map((t) => (t === "mcq" ? "multiple choice" : "fill in the blank")).join(" + "))}</span>
       </div>
     </div>
-    <p class="muted small">Players open this site, choose <b>Join a game</b> and type the code.</p>
+    <p class="muted small">${lobby ? "Scan the QR code with a phone camera, or open" : "Players join at"} <b class="url">${esc(site)}</b> and type the code.</p>
   </section>`;
+  if (!lobby) return info;
+  // Same two columns as the lobby below, so the QR code is exactly as wide as the Build deck card.
+  return `<div class="grid g-side head-split">${info}
+    <img class="qr" src="/api/sessions/${encodeURIComponent(s.code)}/qr.svg" width="400" height="400" alt="QR code that opens this game's join page"></div>`;
 }
 
 function noticesHTML(s) {
@@ -584,15 +658,36 @@ function noticesHTML(s) {
   return held.concat(notes).join("") ? `<div class="grid">${held.concat(notes).join("")}</div>` : "";
 }
 
+// How the deck used Boilerexams past exam questions; nothing at all when it didn't.
+function styleHTML(s) {
+  const by = new Map();
+  for (const st of s.strata) {
+    const bx = st.boilerexams;
+    if (!bx) continue;
+    const t = by.get(bx.course) || { cards: 0, examples: 0, material: false };
+    t.cards += bx.cards; t.examples += bx.examples;
+    t.material = t.material || bx.material;
+    by.set(bx.course, t);
+  }
+  if (!by.size) return "";
+  const parts = [...by].map(([code, t]) => {
+    const what = [t.cards ? `${t.cards} card${t.cards === 1 ? " is a real past exam question" : "s are real past exam questions"}` : "",
+      t.material ? "the AI creates new practice from their questions and correct answers" : t.examples ? "the AI writes in their style" : ""].filter(Boolean).join(", and ");
+    return `<b>${esc(spacedCode(code))}</b>: ${what}`;
+  });
+  return `<div class="notice good">${ICON.info}<p class="small">From <a href="https://boilerexams.com" target="_blank" rel="noopener">Boilerexams</a> · ${parts.join("; ")}.</p></div>`;
+}
+
 function sectionsHTML(s) {
   return `<section class="card">
     <div class="card-head"><div><p class="eyebrow">The deck is dealt evenly across</p><h2>${s.strata.length} section${s.strata.length === 1 ? "" : "s"}</h2></div></div>
     <ul class="sections">${s.strata.map((st) => {
       const c = st.counts;
       const tag = (n, word) => `<span class="${n ? "" : "zero"}">${n} ${word}</span>`;
-      return `<li><b>${esc(st.label)}</b><div class="counts">${tag(c.brightspace, "from Brightspace")}${tag(c.upload, "from files")}${tag(c.notes, "from notes")}</div></li>`;
+      const bx = st.boilerexams && st.boilerexams.cards ? `<span class="bx">${st.boilerexams.cards} from past exams</span>` : "";
+      return `<li><b>${esc(st.label)}</b><div class="counts">${s.has_brightspace ? tag(c.brightspace, "from Brightspace") : ""}${tag(c.upload, "from files")}${tag(c.notes, "from notes")}${bx}</div></li>`;
     }).join("")}</ul>
-    <p class="hint">Counts are passages of material. Brightspace material is read when the host builds the deck.</p>
+    <p class="hint">Counts are passages of material.${s.has_brightspace ? " Brightspace material is read when the host builds the deck." : " Every player can add notes and files."}</p>
     ${(s.picked || []).map(pickedHTML).join("")}
   </section>`;
 }
@@ -607,17 +702,36 @@ function pickedHTML(p) {
 function playersHTML(s) {
   const play = s.status === "ready";
   return `<section class="card">
-    <p class="eyebrow">${play ? "Scoreboard" : "Players"}</p>
-    <ul class="players">${s.players.slice().sort((a, b) => (play ? b.score - a.score : 0)).map((p) => {
+    <p class="eyebrow">Players</p>
+    <ul class="players">${s.players.map((p) => {
       let note = p.host ? "Host" : "Player";
       if (!play && s.has_brightspace) note += p.missing.length ? ` · not verified for ${p.missing.join(", ")}` : " · verified for every course";
       if (!play && p.uploads) note += ` · ${p.uploads} file${p.uploads === 1 ? "" : "s"}`;
-      if (play && s.card) note = p.answered_current ? (p.correct_current ? "Got this one" : "Missed this one") : "Thinking…";
+      const kick = s.role === "host" && !p.host && s.status !== "building"
+        ? `<button type="button" class="x-btn" data-kick="${esc(p.key)}" data-name="${esc(p.name)}" aria-label="Remove ${esc(p.name)} from the game" title="Remove from game">×</button>`
+        : s.role === "host" && s.status !== "building" ? '<span class="x-space" aria-hidden="true"></span>' : ""; // keeps the scores lined up
       return `<li class="${p.me ? "me" : ""}"><span class="avatar" aria-hidden="true">${esc(p.name.slice(0, 1).toUpperCase())}</span>
         <span><b>${esc(p.name)}${p.me ? " (you)" : ""}</b><small>${esc(note)}</small></span>
-        ${play ? `<span class="score" aria-label="${esc(p.score)} points">${esc(p.score)}</span>` : (!s.has_brightspace ? "" : p.missing.length ? '<span class="dot" title="Not verified"></span>' : '<span class="dot on" title="Verified"></span>')}</li>`;
+        ${play || !s.has_brightspace ? "" : p.missing.length ? '<span class="dot" title="Not verified"></span>' : '<span class="dot on" title="Verified"></span>'}${kick}</li>`;
     }).join("")}</ul>
   </section>`;
+}
+
+// The host removes a player, after confirming in place (window.confirm is unreliable in some browsers).
+function bindPlayers(el) {
+  $$("[data-kick]", el).forEach((b) => b.addEventListener("click", () => {
+    const li = b.closest("li"), original = li.innerHTML;
+    li.innerHTML = `<div class="confirm-box kick-box" role="alertdialog" aria-label="Remove ${esc(b.dataset.name)}">
+      <p class="small"><b>Remove ${esc(b.dataset.name)}?</b> They can't rejoin this game, and their uploaded material is removed.</p>
+      <div class="btn-row"><button class="btn danger sm" type="button" data-yes>Remove</button><button class="btn line sm" type="button" data-no>Cancel</button></div></div>`;
+    const yes = $("[data-yes]", li);
+    yes.focus();
+    yes.addEventListener("click", () => guarded(yes, async () => {
+      render(await api(`/api/sessions/${game.code}/kick`, { method: "POST", json: { player: b.dataset.kick } }));
+      toast(`${b.dataset.name} was removed from the game.`);
+    }));
+    $("[data-no]", li).addEventListener("click", () => { li.innerHTML = original; bindPlayers(li); });
+  }));
 }
 
 function hostHTML(s) {
@@ -633,17 +747,24 @@ function hostHTML(s) {
       <div class="meter" data-pct="${pct}"><i></i></div>
       <p class="small muted">${esc(s.deck.total)} written so far by ${esc(s.generator)}. ${s.deck.refilling ? "New cards are on the way." : "Refills automatically when it runs low."}</p>
       ${s.role === "host"
-        ? (s.card && !s.my_answer
-          ? `<button class="btn dark big wide" type="button" id="drawBtn" disabled aria-describedby="drawWait">Draw next card</button><p class="small muted" id="drawWait">Answer this card first${s.card.type === "fill_blank" ? " (or press I don't know)" : ""}, then you can draw the next one.</p>`
+        ? (s.card && !s.outcome
+          ? `<button class="btn dark big wide" type="button" id="drawBtn" disabled aria-describedby="drawWait">Draw next card</button><p class="small muted" id="drawWait">Enter ${esc(s.answering ? `${s.answering.name}'s` : "the")} answer on the card first (or press Didn't know), then you can draw the next one.</p>`
           : `<button class="btn dark big wide" type="button" id="drawBtn">${s.card ? "Draw next card" : "Draw first card"}</button>`)
         : '<p class="small muted">The host draws each card.</p>'}
     </section>`;
   }
   const mine = s.players.find((p) => p.me);
   let share = "";
-  if (s.has_brightspace && !me.brightspace.connected) {
+  const bs = me.brightspace;
+  if (s.has_brightspace && bs.signing_in) {
+    share = `<div class="notice">${ICON.info}<p class="small"><b>Signing in to Brightspace…</b> ${bs.signin_on_host
+      ? "Go to the computer running Study Deck: a Purdue sign-in window with your name is open there. Sign in with your own account."
+      : "Finish in the Purdue tab."} This page updates by itself.</p></div>`;
+  } else if (s.has_brightspace && !bs.connected) {
     share = `<div class="grid"><p class="small muted">Connect Brightspace so the game can confirm you're enrolled. Until everyone is, that course's Brightspace material stays out of the deck.</p>
-      <a class="btn line" href="/auth/brightspace/start?next=${encodeURIComponent(`/#/game/${s.code}`)}">${me.demo_mode ? "Load sample courses" : "Connect Brightspace"}</a></div>`;
+      ${bs.can_connect ? `<a class="btn line" href="/auth/brightspace/start?next=${encodeURIComponent(`/#/game/${s.code}`)}">Connect Brightspace</a>
+      ${bs.signin_on_host ? '<p class="hint">Opens a Purdue sign-in window for you on the computer running Study Deck. You sign in there with your own account and Authenticator.</p>' : ""}`
+        : '<p class="hint">Brightspace can only be connected on the computer running Study Deck.</p>'}</div>`;
   } else if (s.has_brightspace) {
     share = `<label class="switch"><span><b>Use my Brightspace material</b><span class="hint">Only for courses every player is enrolled in.</span></span>
       <input type="checkbox" id="shareToggle" ${mine && mine.share_brightspace ? "checked" : ""}><span class="track" aria-hidden="true"></span></label>`;
@@ -665,41 +786,177 @@ function bindHost(el) {
   if (share) share.addEventListener("change", () => guarded(null, async () => render(await api(`/api/sessions/${game.code}/share`, { method: "POST", json: { share: share.checked } }))));
 }
 
+const UPLOAD_TYPES = [".pdf", ".docx", ".pptx", ".txt", ".md", ".html", ".htm"];
+const MAX_FILE_BYTES = 15 * 1048576;
+const BATCH_FILES = 8, BATCH_BYTES = 40 * 1048576; // the server takes up to 60 MB per request
+// Folder picking works in desktop browsers; phones only pick files.
+const CAN_PICK_FOLDER = "webkitdirectory" in document.createElement("input") && !matchMedia("(pointer: coarse)").matches;
+
 function uploadHTML(s) {
   if (s.status === "building") return "";
   const inPlay = s.status === "ready";
   return `${inPlay ? "" : '<section class="card"><p class="eyebrow">Add material</p><h2>Your notes &amp; files</h2>'}
     <form id="uploadForm" class="grid" novalidate>
       <label class="f">Section<select class="input" name="stratum">${s.strata.map((st) => `<option value="${esc(st.id)}">${esc(st.label)}</option>`).join("")}</select></label>
-      <label class="drop" id="drop">${ICON.file}<b>Drop files or browse</b><span class="hint">PDF, Word, PowerPoint, text. Up to 15 MB each.</span>
-        <input type="file" name="files" multiple accept=".pdf,.docx,.pptx,.txt,.md,.html,.htm"></label>
-      <ul class="files" id="fileList"></ul>
+      <div class="grid tight-gap">
+        <label class="drop" id="drop">${ICON.file}<b>Drop files or folders here</b><span class="hint">or click to browse. PDF, Word, PowerPoint, text. Up to 15 MB each.</span>
+          <input type="file" id="pickFiles" multiple accept="${UPLOAD_TYPES.join(",")}"></label>
+        ${CAN_PICK_FOLDER ? '<label class="btn line wide folder-btn">Choose a whole folder<input type="file" id="pickFolder" webkitdirectory multiple></label>' : ""}
+      </div>
+      <div id="fileList" aria-live="polite"></div>
       <label class="f notes-f">Or paste notes<textarea class="input" name="notes" maxlength="60000" placeholder="Paste your own study notes"></textarea></label>
       <label class="check"><input type="checkbox" name="attest" value="yes"><span>This is my own work or course material I'm allowed to share with these players. No exams, quizzes, answer keys or other students' personal information.</span></label>
       <button class="btn gold wide" type="submit">Add to the deck</button>
     </form>${inPlay ? "" : "</section>"}`;
 }
 
+/* Files waiting to be added. Each pick or drop adds to this list (it never replaces
+   it), and it outlives re-renders of the upload box. Cleared when they're sent. */
+let picks = { code: null, files: [] };
+function pickedFiles() {
+  if (picks.code !== game.code) picks = { code: game.code, files: [] };
+  return picks.files;
+}
+
+// Every file in a drop, opening dropped folders at any depth. The browser only lets
+// a drop be read during the event, so the entries are taken before the first await.
+async function droppedFiles(dt) {
+  const entries = [...(dt.items || [])].map((it) => (it.webkitGetAsEntry ? it.webkitGetAsEntry() : null)).filter(Boolean);
+  const plain = [...dt.files].map((file) => ({ file, path: file.name }));
+  if (!entries.length) return plain;
+  const out = [];
+  const walk = async (entry) => {
+    if (entry.isFile) {
+      out.push({ file: await new Promise((ok, bad) => entry.file(ok, bad)), path: entry.fullPath.replace(/^\//, "") });
+    } else if (entry.isDirectory) {
+      const reader = entry.createReader();
+      for (;;) { // a folder is read in pages until an empty one comes back
+        const page = await new Promise((ok, bad) => reader.readEntries(ok, bad));
+        if (!page.length) break;
+        for (const e of page) await walk(e);
+      }
+    }
+  };
+  for (const e of entries) await walk(e);
+  return out;
+}
+
+function addPicks(items) {
+  const list = pickedFiles();
+  const seen = new Set(list.map((p) => `${p.path}|${p.file.size}`));
+  let wrongType = 0;
+  const tooBig = [];
+  for (const { file, path } of items) {
+    const name = file.name;
+    if (!file.size || name.startsWith(".") || name.startsWith("~$")) continue; // empty, hidden and Office lock files
+    if (!UPLOAD_TYPES.includes(name.slice(name.lastIndexOf(".")).toLowerCase())) { wrongType++; continue; }
+    if (file.size > MAX_FILE_BYTES) { tooBig.push(name); continue; }
+    const key = `${path}|${file.size}`;
+    if (seen.has(key)) continue; // the same file picked twice
+    seen.add(key);
+    list.push({ file, path });
+  }
+  const left = [];
+  if (wrongType) left.push(`${wrongType} file${wrongType === 1 ? " that isn't" : "s that aren't"} PDF, Word, PowerPoint or text`);
+  if (tooBig.length) left.push(`${tooBig.join(", ")} (over 15 MB)`);
+  if (left.length) toast(`Left out ${left.join(" and ")}.`, true);
+}
+
+function uploadRoom() {
+  return game.state ? Math.max(0, game.state.me.max_uploads - game.state.me.uploads) : Infinity;
+}
+
+const fileSize = (bytes) => (bytes < 1048576 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / 1048576).toFixed(1)} MB`);
+
+function fileListHTML() {
+  const list = pickedFiles();
+  if (!list.length) return "";
+  const total = list.reduce((n, p) => n + p.file.size, 0);
+  const room = uploadRoom();
+  const over = list.length > room
+    ? `<p class="small err-text">You can add ${room} more file${room === 1 ? "" : "s"} in this game. Remove ${list.length - room} to continue.</p>` : "";
+  return `<div class="picked-files">
+    <div class="picked-head"><b>${list.length} file${list.length === 1 ? "" : "s"} ready</b><span class="muted small">${fileSize(total)}</span>
+      <button type="button" class="link-btn" data-clear>Clear all</button></div>${over}
+    <ul class="files">${list.map((p, i) => `<li><span class="fname" title="${esc(p.path)}">${esc(p.path)}</span>
+      <span class="muted">${fileSize(p.file.size)}</span>
+      <button type="button" class="x-btn" data-remove="${i}" aria-label="Remove ${esc(p.path)}">×</button></li>`).join("")}</ul></div>`;
+}
+
 function bindUpload(el) {
   const form = $("#uploadForm", el);
   if (!form) return;
-  const input = $("input[type=file]", form);
   const drop = $("#drop", form);
   const list = $("#fileList", form);
-  const show = () => { list.innerHTML = [...input.files].map((f) => `<li>${esc(f.name)} <span class="muted">· ${(f.size / 1048576).toFixed(1)} MB</span></li>`).join(""); };
-  input.addEventListener("change", show);
+  const show = () => { list.innerHTML = fileListHTML(); };
+  show();
+  for (const input of $$("input[type=file]", form)) {
+    input.addEventListener("change", () => {
+      addPicks([...input.files].map((file) => ({ file, path: file.webkitRelativePath || file.name })));
+      input.value = ""; // so the same file can be picked again after removing it
+      show();
+    });
+  }
   ["dragenter", "dragover"].forEach((t) => drop.addEventListener(t, (e) => { e.preventDefault(); drop.classList.add("over"); }));
   ["dragleave", "drop"].forEach((t) => drop.addEventListener(t, (e) => { e.preventDefault(); drop.classList.remove("over"); }));
-  drop.addEventListener("drop", (e) => { input.files = e.dataTransfer.files; show(); });
+  drop.addEventListener("drop", (e) => {
+    const reading = droppedFiles(e.dataTransfer);
+    guarded(null, async () => { addPicks(await reading); show(); });
+  });
+  list.addEventListener("click", (e) => {
+    const rm = e.target.closest("[data-remove]");
+    if (rm) pickedFiles().splice(Number(rm.dataset.remove), 1);
+    else if (e.target.closest("[data-clear]")) pickedFiles().length = 0;
+    else return;
+    show();
+  });
   form.addEventListener("submit", (e) => {
     e.preventDefault();
-    guarded($("button[type=submit]", form), async () => {
+    const button = $("button[type=submit]", form);
+    const label = button.textContent;
+    guarded(button, async () => {
       if (!form.attest.checked) throw new Error("Confirm you're allowed to share this material.");
-      const res = await api(`/api/sessions/${game.code}/upload`, { method: "POST", form: new FormData(form) });
-      form.reset(); list.innerHTML = "";
-      const what = `Added ${res.added} passage${res.added === 1 ? "" : "s"} of material.${res.writing ? " Cards from it are being written and will be mixed into the cards still to come." : ""}`;
-      toast(res.skipped.length ? `${what} Skipped: ${res.skipped.join("; ")}` : what, res.skipped.length > 0);
-      render(res.state);
+      const files = pickedFiles().slice();
+      const notes = form.notes.value.trim();
+      if (!files.length && !notes) throw new Error("Add a file or paste some notes.");
+      if (files.length > uploadRoom()) throw new Error(`You can add ${uploadRoom()} more files in this game. Remove some first.`);
+      // Sent a few at a time, so a whole folder never makes one huge request.
+      const batches = [[]];
+      let size = 0;
+      for (const p of files) {
+        const cur = batches[batches.length - 1];
+        if (cur.length && (cur.length >= BATCH_FILES || size + p.file.size > BATCH_BYTES)) { batches.push([]); size = 0; }
+        batches[batches.length - 1].push(p);
+        size += p.file.size;
+      }
+      let added = 0, writing = false, state = null;
+      const skipped = [];
+      try {
+        for (const [i, batch] of batches.entries()) {
+          if (files.length > 1) {
+            const first = files.indexOf(batch[0]) + 1, last = first + batch.length - 1;
+            button.textContent = `Adding ${first === last ? first : `${first}–${last}`} of ${files.length}…`;
+          }
+          const fd = new FormData();
+          fd.append("stratum", form.stratum.value);
+          fd.append("attest", "yes");
+          if (i === 0 && notes) fd.append("notes", notes);
+          for (const p of batch) fd.append("files", p.file, p.file.name);
+          const res = await api(`/api/sessions/${game.code}/upload`, { method: "POST", form: fd });
+          added += res.added; writing = writing || res.writing; state = res.state;
+          skipped.push(...res.skipped);
+          // Only what's been sent leaves the list, so if something fails the rest stays.
+          picks.files = pickedFiles().filter((p) => !batch.includes(p));
+          if (i === 0) form.notes.value = "";
+        }
+      } finally {
+        button.textContent = label;
+        show();
+        if (state) render(state);
+      }
+      form.attest.checked = false;
+      const what = `Added ${added} passage${added === 1 ? "" : "s"} of material.${writing ? " Cards from it are being written and will be mixed into the cards still to come." : ""}`;
+      toast(skipped.length ? `${what} Skipped: ${skipped.join("; ")}` : what, skipped.length > 0);
     });
   });
 }
@@ -713,48 +970,53 @@ function cardHTML(s) {
     const msg = s.deck.remaining || !s.deck.refilling ? (s.role === "host" ? "Draw the first card when your board is set up." : "Waiting for the host to draw a card.") : "The deck ran out. New cards are being written…";
     return `<section class="card empty-card">${ICON.cards}<h2>Ready to play</h2><p class="muted">${esc(msg)}</p></section>`;
   }
-  const c = s.card, mine = s.my_answer;
+  // The physical board determines turns; only the host's screen checks the answer.
+  const c = s.card, out = s.outcome, host = s.role === "host";
   let body;
   if (c.type === "mcq") {
     body = `<div class="options">${c.options.map((o, i) => {
       let cls = "";
-      if (mine) { if (o === mine.expected) cls = "right"; else if (o === mine.given) cls = "wrong"; }
-      return `<button type="button" class="opt ${cls}" data-opt="${i}" ${mine ? "disabled" : ""}><span class="letter">${"ABCDE"[i]}</span><span>${esc(o)}</span></button>`;
-    }).join("")}</div>`;
+      if (out) { if (o === out.expected) cls = "right"; else if (o === out.given) cls = "wrong"; }
+      const inner = `<span class="letter">${"ABCDE"[i]}</span><span>${esc(o)}</span>`;
+      return host && !out
+        ? `<button type="button" class="opt" data-opt="${i}">${inner}</button>`
+        : `<div class="opt ${cls} static">${inner}</div>`;
+    }).join("")}</div>${host && !out ? '<div class="idk-row"><button class="btn line sm" id="idkBtn" type="button">Didn\'t know</button></div>' : ""}`;
   } else {
-    body = mine ? "" : `<form class="dock" id="blankForm" novalidate><input name="answer" maxlength="80" autocomplete="off" spellcheck="false" placeholder="Type the missing word" aria-label="Your answer">
-      <button class="send" type="submit" aria-label="Submit answer">${ICON.up}</button></form>
-      <div class="idk-row"><button class="btn line sm" id="idkBtn" type="button">I don't know</button></div>`;
+    body = host && !out ? `<form class="dock" id="blankForm" novalidate><input name="answer" maxlength="80" autocomplete="off" spellcheck="false" placeholder="Type the answer they gave" aria-label="Answer they gave">
+      <button class="send" type="submit" aria-label="Check answer">${ICON.up}</button></form>
+      <div class="idk-row"><button class="btn line sm" id="idkBtn" type="button">Didn't know</button></div>` : "";
   }
-  const result = mine ? `<div class="result ${mine.correct ? "ok" : "no"}" role="status"><b>${mine.correct ? "Correct" : mine.skipped ? "Skipped" : "Not quite"}</b>
-      ${mine.correct ? "" : `<p>Answer: <b>${esc(mine.expected)}</b>${c.type === "fill_blank" && !mine.skipped ? ` · you wrote “${esc(mine.given)}”` : ""}</p>`}
-      ${mine.explanation ? `<p class="small">${esc(mine.explanation)}</p>` : ""}</div>` : "";
+  const result = out ? `<div class="result ${out.correct ? "ok" : "no"}" role="status"><b>${out.correct ? "Correct" : out.skipped ? "Didn't know" : "Not quite"}</b>
+      ${out.correct ? "" : `<p>Answer: <b>${esc(out.expected)}</b>${c.type === "fill_blank" && !out.skipped ? ` · answered “${esc(out.given)}”` : ""}</p>`}
+      ${out.explanation ? `<p class="small">${esc(out.explanation)}</p>` : ""}</div>` : "";
   return `<article class="qcard" aria-label="Question card ${esc(c.number)}">
-    <div class="strip"><b>${esc(c.label)}</b><span class="small">Card ${esc(c.number)} · ${c.type === "mcq" ? "Multiple choice" : "Fill in the blank"}</span></div>
+    <div class="strip"><b>${esc(c.label)}</b><span class="small">Card ${esc(c.number)} · ${c.source ? `<span class="past">${esc(c.source)}</span>` : c.type === "mcq" ? "Multiple choice" : "Fill in the blank"}</span></div>
     <div class="body"><p class="prompt">${promptHTML(c.prompt)}</p>${body}${result}</div>
   </article>`;
 }
 
 function bindCard(el) {
   const s = game.state;
-  if (!s.card) return;
-  const submit = (answer, skip = false) => api(`/api/sessions/${game.code}/answer`, { method: "POST", json: { question_id: s.card.id, answer, skip } }).then(render);
+  if (!s.card || s.role !== "host" || s.outcome) return;
+  const submit = (answer, skip = false) => api(`/api/sessions/${game.code}/answer`, {
+    method: "POST", json: { question_id: s.card.id, answer, skip },
+  }).then(render);
   $$("[data-opt]", el).forEach((b) => b.addEventListener("click", () => {
     b.classList.add("picked");
     guarded(null, () => submit(Number(b.dataset.opt)));
   }));
   const form = $("#blankForm", el);
   if (form) {
-    form.answer.focus({ preventScroll: true });
     form.addEventListener("submit", (e) => {
       e.preventDefault();
       if (!form.answer.value.trim()) return;
       $(".send", form).classList.add("go");
       guarded($(".send", form), () => submit(form.answer.value));
     });
-    const idk = $("#idkBtn", el);
-    idk.addEventListener("click", () => guarded(idk, () => submit("", true)));
   }
+  const idk = $("#idkBtn", el);
+  if (idk) idk.addEventListener("click", () => guarded(idk, () => submit("", true)));
 }
 
 /* Confirmation is shown in the page: window.confirm() is blocked in some

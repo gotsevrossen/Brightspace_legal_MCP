@@ -4,19 +4,26 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import html
+import io
 import json
+import os
 from base64 import b64decode
 import hashlib
 import hmac
 import logging
 import re
 import secrets
+import socket
 import sys
 import time
+import webbrowser
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit
+
+import httpx
 
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
@@ -30,20 +37,35 @@ from starlette.staticfiles import StaticFiles
 from purdue_brightspace_mcp.client import AuthRequired, BrightspaceHTTPError
 from purdue_brightspace_mcp.policy import AuditLog, PolicyViolation
 
-from .brightspace import (BrowserTransport, Course, DemoSource, LiveSource, Source, TokenTransport, WebOAuth,
+from .brightspace import (BrowserTransport, Course, GuestTransport, LiveSource, Source, TokenTransport, WebOAuth,
                           pkce_pair)
+from .boilerexams import Boilerexams, spaced as spaced_code
 from .config import StudyDeckSettings
 from .picker import pick_files
 from .extract import UnsupportedFile, extract_text
 from .game import GameSession, Player, SessionStore, Stratum, make_chunks, spawn
 from . import genai as genai_mod
-from .genai import QUESTION_TYPES, GenAIStudio, GenerationError, Generator, OfflineGenerator
+from .genai import QUESTION_TYPES, GenAIStudio, GenerationError, Generator
 
 log = logging.getLogger("study_deck")
 STATIC = Path(__file__).parent / "static"
 NAME_MAX = 24
 KEYRING_SERVICE = "study-deck"
 LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def lan_address() -> str | None:
+    """This computer's address on the local network, e.g. 192.168.1.23.
+
+    A UDP "connect" sends no packets; it only asks the OS which network adapter
+    it would use for outside traffic, which is the Wi-Fi or Ethernet one."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+    except OSError:
+        return None
+    return None if not ip or ip.startswith("127.") or ip == "0.0.0.0" else ip
 
 
 def _keyring():
@@ -92,12 +114,68 @@ class StudyDeck:
         self.store = SessionStore(settings.session_ttl_minutes * 60, settings.max_sessions)
         self.audit = AuditLog(settings.brightspace.state_dir / "study-deck-audit.jsonl",
                               settings.brightspace.audit_log_enabled)
-        self.oauth = WebOAuth(settings) if settings.oauth_client_id and not settings.demo_mode else None
+        self.oauth = WebOAuth(settings) if settings.oauth_client_id else None
+        # Tests plug a fake Brightspace in here; the app itself never sets it.
+        self.source_factory: Callable[[], Source] | None = None
         self._tasks: set[asyncio.Task] = set()
         # Personal sign-in: the one browser window Study Deck runs in on this computer.
         self.window: BrowserTransport | None = None
         # One-time links that open Study Deck in that window as the same player.
         self.handoffs: dict[str, tuple[str, float]] = {}
+        # Pages that open another player's private sign-in window: token -> (name, expiry).
+        self.intros: dict[str, tuple[str, float]] = {}
+        # Past exam questions used as a style guide for the AI (tests swap in a fake).
+        self.boilerexams = Boilerexams() if settings.boilerexams else None
+
+    async def load_styles(self, session: GameSession) -> None:
+        """Before writing cards, find each section's course on Boilerexams: read a few of
+        its past exam questions for the AI to model its questions on, and let the game
+        deal some real ones as cards. If Boilerexams can't be used, nothing is said."""
+        bx = self.boilerexams
+        if not session.use_boilerexams or bx is None:
+            return
+        session.exam_material.clear()
+        codes: dict[str, str] = {}
+        for s in session.strata:
+            try:
+                code = await bx.match(s.course_label)
+                if code is None:
+                    continue
+                codes[s.id] = code
+                exam_based = not session.material_for(s)
+                text, count = await bx.style_text(code, _focus(s), related_only=exam_based)
+                session.style_info[s.id] = (code, count)
+                if count:
+                    session.styles[s.id] = text
+                    if exam_based:
+                        session.exam_material[s.id] = text
+                elif exam_based:
+                    session.notices.append(f"No usable Boilerexams questions matched {s.label}. "
+                                           "Try the whole course, a different topic, or add your own material.")
+            except (httpx.HTTPError, ValueError, KeyError, TypeError):
+                log.info("Boilerexams unavailable for %s", s.label)
+                if not session.material_for(s):
+                    session.notices.append(f"Couldn't load Boilerexams questions for {s.label}. Try again later.")
+        if not codes:
+            return
+
+        async def past_exams(stratum: Stratum, want: int, skip: set[str]) -> list[dict[str, Any]]:
+            code = codes.get(stratum.id)
+            if code is None:
+                return []
+            out = []
+            for ex in await bx.cards(code, _focus(stratum), want, skip):
+                exam = await bx.exam_name(code, ex.exam_id)
+                course = spaced_code(code)
+                out.append({
+                    "qid": ex.qid, "type": "mcq", "prompt": ex.card_prompt, "options": ex.card_options,
+                    "answer_index": ex.answer, "keep_order": ex.keep_order,
+                    "source": f"Past exam · {exam}" if exam else "Past exam",
+                    "explanation": f"From the {exam + ' ' if exam else ''}{course} exam, via Boilerexams.",
+                })
+            return out
+
+        session.past_exams = past_exams
 
     def app_window(self) -> BrowserTransport:
         if self.window is None:
@@ -163,6 +241,37 @@ class StudyDeck:
         finally:
             user.signing_in = False
 
+    async def guest_sign_in(self, user: User) -> None:
+        """Personal sign-in for a player on another device: a private window of the
+        Study Deck browser opens on this computer, starting on a page that names them."""
+        transport = GuestTransport(self.app_window())
+        now = time.time()
+        self.intros = {t: v for t, v in self.intros.items() if v[1] > now}
+        token = secrets.token_urlsafe(24)
+        self.intros[token] = (user.name, now + 600)
+        try:
+            await transport.sign_in(intro_url=f"{self.settings.public_url}/signin-for/{token}")
+            source = LiveSource(self.settings, transport, self.audit)
+            source.kind = "personal"
+            user.source = source
+            await self.load_courses(user)
+            self.audit.write("study_deck_guest_sign_in", courses=len(user.courses))
+        except (AuthRequired, BrightspaceHTTPError, PolicyViolation) as exc:
+            await transport.close()
+            user.source, user.courses = None, {}
+            user.signin_error = str(exc)
+        except Exception:
+            log.exception("guest sign-in failed")
+            await transport.close()
+            user.source, user.courses = None, {}
+            user.signin_error = "Brightspace sign-in failed. Try again."
+        finally:
+            self.intros.pop(token, None)
+            user.signing_in = False
+
+    def in_a_game(self, user: User) -> bool:
+        return any(user.id in s.players for s in self.store.sessions.values())
+
     # ---------------------------------------------------------------- helpers
 
     def course_key(self, org_id: int) -> str:
@@ -195,12 +304,19 @@ class StudyDeck:
     def _purge_users(self, now: float) -> None:
         ttl = self.settings.session_ttl_minutes * 60
         for uid in [u for u, user in self.users.items() if now - user.last_active > ttl]:
-            self.users.pop(uid, None)
+            gone = self.users.pop(uid, None)
+            # A player who left also leaves their private sign-in window.
+            if gone is not None and gone.source is not None and not gone.signing_in:
+                task = asyncio.ensure_future(gone.source.close())
+                self._tasks.add(task)
+                task.add_done_callback(self._tasks.discard)
 
     def session_for(self, code: str, user: User, *, host: bool = False) -> GameSession:
         session = self.store.get(code)
         if session is None:
             raise ApiError("That game doesn't exist or has ended.", 404)
+        if user.id in session.kicked:
+            raise ApiError("The host removed you from this game.", 403)
         if user.id not in session.players:
             raise ApiError("Join this game first.", 403)
         if host and session.host_id != user.id:
@@ -210,6 +326,31 @@ class StudyDeck:
             known = self.users.get(pid)
             player.verified_org_ids = known.verified if known else frozenset()
         return session
+
+    @property
+    def brightspace_available(self) -> bool:
+        return self.settings.brightspace_enabled or self.source_factory is not None
+
+    def can_connect(self, request: Request) -> bool:
+        """Anyone can connect. With personal sign-in, players on other devices sign in on
+        the computer running Study Deck, once they've joined a game there."""
+        return self.brightspace_available
+
+    def join_base(self, request: Request) -> str:
+        """The address other players open or scan to reach this game.
+
+        On a hosted server that's its public URL. When Study Deck runs on this
+        computer and you're looking at it as localhost, it's this computer's
+        Wi-Fi address instead, since "localhost" on a phone means the phone."""
+        public = urlsplit(self.settings.public_url)
+        if (public.hostname or "") not in LOCAL_HOSTS:
+            return self.settings.public_url
+        url = request.url
+        if (url.hostname or "") in LOCAL_HOSTS and self.settings.host not in LOCAL_HOSTS:
+            ip = lan_address()
+            if ip:
+                return f"http://{ip}:{url.port or self.settings.port}"
+        return f"{url.scheme}://{url.netloc}"
 
     # ------------------------------------------------------- GenAI Studio key
 
@@ -246,8 +387,6 @@ class StudyDeck:
         key = (form_key or "").strip() or key
         if key:
             return GenAIStudio(self.settings.genai_url, model, key)
-        if self.settings.demo_mode:
-            return OfflineGenerator()
         raise ApiError("Add your Purdue GenAI Studio API key in Settings to write questions.")
 
     async def load_courses(self, user: User) -> None:
@@ -261,10 +400,11 @@ class StudyDeck:
         card = session.current.public() if session.current else None
         if card:
             card["number"] = session.card_number
-        mine = session.answers.get(user.id)
-        my_answer = None
-        if mine and session.current:
-            my_answer = {**mine, "expected": session.current.expected, "explanation": session.current.explanation}
+        # Show the card's result on every screen; turns belong to the physical game.
+        answering = outcome = None
+        if session.current is not None and session.outcome is not None:
+            outcome = {**session.outcome, "expected": session.current.expected,
+                       "explanation": session.current.explanation}
         orgs = session.course_orgs()
         return {
             "code": session.code,
@@ -277,16 +417,15 @@ class StudyDeck:
             "deck_size": session.deck_size,
             "strata": [
                 {"id": s.id, "label": s.label, "kind": s.kind, "course": s.course_label,
-                 "counts": session.source_counts(s)}
+                 "counts": session.source_counts(s),
+                 "boilerexams": _boilerexams_view(session, s)}
                 for s in session.strata
             ],
             "players": [
                 {
-                    "name": p.name, "host": p.is_host, "me": p.id == user.id, "score": p.score,
+                    "key": p.key, "name": p.name, "host": p.is_host, "me": p.id == user.id, "score": p.score,
                     "answered": p.answered, "uploads": p.uploads, "share_brightspace": p.share_brightspace,
                     "missing": [label for org, label in orgs.items() if org not in p.verified_org_ids],
-                    "answered_current": p.id in session.answers,
-                    "correct_current": session.answers.get(p.id, {}).get("correct"),
                 }
                 for p in session.players.values()
             ],
@@ -295,9 +434,28 @@ class StudyDeck:
             "has_brightspace": bool(orgs),
             "deck": {"total": len(session.deck), "remaining": session.remaining(), "refilling": session.refilling},
             "card": card,
-            "my_answer": my_answer,
-            "me": {"name": me.name, "score": me.score, "share_brightspace": me.share_brightspace},
+            "answering": answering,
+            "outcome": outcome,
+            "me": {"name": me.name, "score": me.score, "share_brightspace": me.share_brightspace,
+                   "uploads": me.uploads, "max_uploads": self.settings.max_files_per_player},
         }
+
+
+def _boilerexams_view(session: GameSession, s: Stratum) -> dict[str, Any] | None:
+    """How a section used Boilerexams, or None when it didn't (nothing is shown then)."""
+    code, examples = session.style_info.get(s.id, ("", 0))
+    cards = session.past_cards.get(s.id, 0)
+    if not code or not (examples or cards):
+        return None
+    view = {"course": code, "examples": examples, "cards": cards}
+    if session.exam_material.get(s.id) and not session.material_for(s):
+        view["material"] = True
+    return view
+
+
+def _focus(stratum: Stratum) -> list[str]:
+    """What a deck section is about, for finding matching past exam topics."""
+    return stratum.module_labels or ([stratum.topic] if stratum.topic else [])
 
 
 def _clean_name(value: Any) -> str:
@@ -331,10 +489,14 @@ def create_app(settings: StudyDeckSettings | None = None, *, open_window: bool =
             user.name = _clean_name((await body(request)).get("name"))
         return JSONResponse({
             "name": user.name,
-            "demo_mode": settings.demo_mode,
             "personal_mode": settings.browser_mode,
             "max_deck_size": settings.max_deck_size,
-            "brightspace": {"connected": user.source is not None,
+            "join_base": deck.join_base(request),
+            "on_network": settings.host not in LOCAL_HOSTS,
+            "brightspace": {"available": deck.brightspace_available,
+                            "can_connect": deck.can_connect(request),
+                            "signin_on_host": settings.browser_mode and not deck.is_local(request),
+                            "connected": user.source is not None,
                             "mode": user.source.kind if user.source else None,
                             "courses": len(user.courses),
                             "signing_in": user.signing_in,
@@ -351,7 +513,6 @@ def create_app(settings: StudyDeckSettings | None = None, *, open_window: bool =
             "source": source,
             "key_hint": f"…{key[-4:]}" if key and len(key) > 8 else None,
             "model": model,
-            "offline_demo": settings.demo_mode and not key,
             "can_remember": deck.is_local(request) and _keyring() is not None,
             "remembered": source == "saved" or (deck.is_local(request) and bool(deck.saved_genai()[0])),
         }
@@ -416,21 +577,29 @@ def create_app(settings: StudyDeckSettings | None = None, *, open_window: bool =
         nxt = request.query_params.get("next", "")
         # Only ever return to a game page on this site (no open redirects).
         user.next_url = nxt if re.fullmatch(r"/#/game/[A-Z0-9]{6}", nxt) else "/#connected"
-        if settings.demo_mode:
-            user.source = DemoSource()
+        if deck.source_factory is not None:
+            user.source = deck.source_factory()
             await deck.load_courses(user)
             return RedirectResponse(user.next_url, 303)
+        if not settings.brightspace_enabled:
+            return RedirectResponse("/#signin-unavailable", 303)
         if settings.browser_mode:
-            # Personal sign-in uses this computer's browser, so only the person at this computer can connect.
-            if not deck.is_local(request):
-                return RedirectResponse("/#signin-local-only", 303)
+            # Personal sign-in uses the browser on this computer. Players on other devices
+            # get a private window there, but only once they're in a game, so nobody else
+            # on the network can open windows on the host's screen.
+            local = deck.is_local(request)
+            if not local and not deck.in_a_game(user):
+                return RedirectResponse("/#signin-join-first", 303)
+            if not local and not user.signing_in and \
+                    sum(u.signing_in for u in deck.users.values()) >= settings.max_players:
+                return RedirectResponse("/#signin-busy", 303)
             if not user.signing_in:
                 if user.source is not None:
                     await user.source.close()
                 user.source, user.courses = None, {}
                 user.signing_in, user.signin_error = True, None
-                deck.audit.write("study_deck_sign_in_start", mode="personal")
-                task = asyncio.create_task(deck.personal_sign_in(user))
+                deck.audit.write("study_deck_sign_in_start", mode="personal" if local else "guest")
+                task = asyncio.create_task(deck.personal_sign_in(user) if local else deck.guest_sign_in(user))
                 deck._tasks.add(task)
                 task.add_done_callback(deck._tasks.discard)
             return RedirectResponse(user.next_url if user.next_url.startswith("/#/game/") else "/#/", 303)
@@ -451,6 +620,27 @@ def create_app(settings: StudyDeckSettings | None = None, *, open_window: bool =
         request.session["uid"] = uid
         user = deck.user_for(request)
         return RedirectResponse(user.next_url if user.next_url.startswith("/#/game/") else "/#/", 303)
+
+    async def signin_intro(request: Request) -> Response:
+        """First page of another player's private sign-in window, on the host's screen:
+        says whose window it is, so the right person signs in to it."""
+        name, expires = deck.intros.get(request.path_params["token"], ("", 0.0))
+        if not deck.is_local(request) or expires < time.time():
+            return Response("This sign-in link has expired. Ask for a new one from Study Deck.",
+                            status_code=404, media_type="text/plain")
+        who = html.escape(name or "this player")
+        brightspace = html.escape(f"{settings.brightspace.base_url}/d2l/home")
+        page = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Brightspace sign-in for {who}</title><link rel="stylesheet" href="/static/app.css"></head>
+<body><main class="wrap"><section class="card lead">
+<p class="eyebrow">Study Deck</p><h1>Sign-in for {who}</h1>
+<p>{who} asked to connect Brightspace from their phone. <b>Only {who} should sign in here</b>, with their
+own Purdue account and Authenticator. This window closes by itself once they're in, and their sign-in
+is kept apart from everyone else's.</p>
+<a class="btn dark big wide" href="{brightspace}">Continue to Purdue sign-in</a>
+</section></main></body></html>"""
+        return Response(page, media_type="text/html")
 
     async def connect_callback(request: Request) -> Response:
         user = deck.user_for(request)
@@ -497,6 +687,17 @@ def create_app(settings: StudyDeckSettings | None = None, *, open_window: bool =
 
     # ---------------------------------------------------------------- sessions
 
+    async def boilerexams_courses(request: Request) -> Response:
+        """Course codes on Boilerexams, so the host page can mark matching courses."""
+        deck.user_for(request)
+        if deck.boilerexams is None:
+            return JSONResponse({"enabled": False, "courses": []})
+        try:
+            codes = sorted(await deck.boilerexams.courses())
+        except (httpx.HTTPError, ValueError, KeyError, TypeError):
+            return JSONResponse({"enabled": True, "courses": [], "unreachable": True})
+        return JSONResponse({"enabled": True, "courses": codes})
+
     async def create_session(request: Request) -> Response:
         user = deck.user_for(request)
         data = await body(request)
@@ -521,7 +722,7 @@ def create_app(settings: StudyDeckSettings | None = None, *, open_window: bool =
                 org = None
                 label = " ".join(str(raw.get("manual_course") or "").split())[:60]
                 if not label:
-                    raise ApiError("Name the course for material you'll upload yourself.")
+                    raise ApiError("Choose a Boilerexams course or name the course for your own material.")
                 if kind == "module":
                     raise ApiError("Modules come from Brightspace; use a topic for a course you typed in.")
             stratum = Stratum(id=f"s{n + 1}", course_label=label, org_id=org, kind=kind)
@@ -553,7 +754,8 @@ def create_app(settings: StudyDeckSettings | None = None, *, open_window: bool =
             raise ApiError(f"Choose a deck of {smallest} to {settings.max_deck_size} cards"
                            f"{' (at least one per section)' if smallest > 1 else ''}.")
         session = GameSession(code=deck.store.new_code(), host_id=user.id, strata=strata, types=types,
-                              deck_size=size, generator=deck.make_generator(data.get("genai_key"), user, request))
+                              deck_size=size, generator=deck.make_generator(data.get("genai_key"), user, request),
+                              use_boilerexams=data.get("boilerexams", True) is not False)
         session.players[user.id] = Player(user.id, user.name, is_host=True, verified_org_ids=user.verified)
         try:
             deck.store.add(session)
@@ -568,6 +770,8 @@ def create_app(settings: StudyDeckSettings | None = None, *, open_window: bool =
         session = deck.store.get(str(request.path_params["code"]))
         if session is None:
             raise ApiError("No game with that code. Check it with the host.", 404)
+        if user.id in session.kicked:
+            raise ApiError("The host removed you from this game.", 403)
         if user.id not in session.players:
             if len(session.players) >= settings.max_players:
                 raise ApiError("This game is full.", 403)
@@ -585,6 +789,17 @@ def create_app(settings: StudyDeckSettings | None = None, *, open_window: bool =
         user = deck.user_for(request)
         session = deck.session_for(request.path_params["code"], user)
         return JSONResponse(deck.view(session, user))
+
+    async def qr(request: Request) -> Response:
+        """QR code that opens this game's join page, for players' phone cameras."""
+        import segno  # noqa: PLC0415
+
+        user = deck.user_for(request)
+        session = deck.session_for(request.path_params["code"], user)
+        buf = io.BytesIO()
+        segno.make(f"{deck.join_base(request)}/#/join/{session.code}", error="m").save(
+            buf, kind="svg", scale=8, border=2, dark="#000000", light="#ffffff", xmldecl=False)
+        return Response(buf.getvalue(), media_type="image/svg+xml")
 
     async def share(request: Request) -> Response:
         user = deck.user_for(request)
@@ -695,6 +910,7 @@ def create_app(settings: StudyDeckSettings | None = None, *, open_window: bool =
                                                        org_id=org, module_id=piece.module_id,
                                                        module_path=piece.module_path))
                     session.brightspace_loaded.add(org)
+                await deck.load_styles(session)
                 added = await session.generate(session.deck_size)
                 if not added:
                     raise GenerationError("No cards could be written from this material.")
@@ -718,8 +934,8 @@ def create_app(settings: StudyDeckSettings | None = None, *, open_window: bool =
         session = deck.session_for(request.path_params["code"], user, host=True)
         if session.status != "ready":
             raise ApiError("Build the deck first.", 409)
-        if session.current is not None and user.id not in session.answers:
-            raise ApiError("Answer this card before drawing the next one.", 409)
+        if session.current is not None and session.outcome is None:
+            raise ApiError("Enter the answer for this card before drawing the next one.", 409)
         if session.draw() is None:
             session.current = None
             if not session.refilling:
@@ -729,13 +945,26 @@ def create_app(settings: StudyDeckSettings | None = None, *, open_window: bool =
         return JSONResponse(deck.view(session, user))
 
     async def answer(request: Request) -> Response:
+        """The host checks an answer; the physical game determines who is answering."""
         user = deck.user_for(request)
-        session = deck.session_for(request.path_params["code"], user)
+        session = deck.session_for(request.path_params["code"], user, host=True)
         data = await body(request)
         try:
-            session.submit(user.id, str(data.get("question_id")), data.get("answer"), skipped=data.get("skip") is True)
+            session.submit(str(data.get("question_id")), data.get("answer"), skipped=data.get("skip") is True)
         except ValueError as exc:
             raise ApiError(str(exc), 409) from exc
+        return JSONResponse(deck.view(session, user))
+
+    async def kick(request: Request) -> Response:
+        user = deck.user_for(request)
+        session = deck.session_for(request.path_params["code"], user, host=True)
+        if session.status == "building":
+            raise ApiError("Wait until the deck is built, then remove them.", 409)
+        player = session.player_by_key((await body(request)).get("player"))
+        if player is None or player.is_host:
+            raise ApiError("That player isn't in this game.", 404)
+        session.remove_player(player.id, kicked=True)
+        deck.audit.write("study_deck_player_removed")
         return JSONResponse(deck.view(session, user))
 
     async def end(request: Request) -> Response:
@@ -751,9 +980,7 @@ def create_app(settings: StudyDeckSettings | None = None, *, open_window: bool =
         if session.host_id == user.id:
             deck.store.end(session.code)
         else:
-            session.players.pop(user.id, None)
-            # Their uploads leave with them.
-            session.chunks = [c for c in session.chunks if c.contributor != user.id or c.source == "brightspace"]
+            session.remove_player(user.id)  # their uploads leave with them
         return JSONResponse({"left": True})
 
     # ------------------------------------------------------------- middleware
@@ -793,6 +1020,7 @@ def create_app(settings: StudyDeckSettings | None = None, *, open_window: bool =
         Route("/auth/brightspace/start", api(connect_start)),
         Route("/auth/brightspace/callback", api(connect_callback)),
         Route("/auth/window", api(window_handoff)),
+        Route("/signin-for/{token}", api(signin_intro)),
         Route("/api/me", api(me), methods=["GET", "POST"]),
         Route("/api/settings/genai", api(genai_save), methods=["POST"]),
         Route("/api/settings/genai/models", api(genai_models), methods=["POST"]),
@@ -802,12 +1030,15 @@ def create_app(settings: StudyDeckSettings | None = None, *, open_window: bool =
         Route("/api/courses/{key}/modules", api(modules)),
         Route("/api/sessions", api(create_session), methods=["POST"]),
         Route("/api/sessions/{code}", api(state)),
+        Route("/api/sessions/{code}/qr.svg", api(qr)),
         Route("/api/sessions/{code}/join", api(join), methods=["POST"]),
         Route("/api/sessions/{code}/share", api(share), methods=["POST"]),
         Route("/api/sessions/{code}/upload", api(upload), methods=["POST"]),
         Route("/api/sessions/{code}/build", api(build), methods=["POST"]),
         Route("/api/sessions/{code}/draw", api(draw), methods=["POST"]),
         Route("/api/sessions/{code}/answer", api(answer), methods=["POST"]),
+        Route("/api/sessions/{code}/kick", api(kick), methods=["POST"]),
+        Route("/api/boilerexams", api(boilerexams_courses)),
         Route("/api/sessions/{code}/end", api(end), methods=["POST"]),
         Route("/api/sessions/{code}/leave", api(leave), methods=["POST"]),
         Mount("/static", StaticFiles(directory=STATIC), name="static"),
@@ -820,8 +1051,13 @@ def create_app(settings: StudyDeckSettings | None = None, *, open_window: bool =
             task = asyncio.create_task(deck.open_window())
             deck._tasks.add(task)
             task.add_done_callback(deck._tasks.discard)
+        elif open_window:
+            # Open the site in this computer's default browser once the server is up.
+            asyncio.get_running_loop().call_later(1.0, webbrowser.open, settings.public_url)
         yield
         await deck.close_window()
+        if deck.boilerexams is not None:
+            await deck.boilerexams.close()
 
     app = Starlette(
         routes=routes,
@@ -844,12 +1080,24 @@ def main() -> None:
     settings = StudyDeckSettings.from_env()
     if settings.browser_mode:
         log.warning("Personal sign-in mode: Brightspace uses your own session on this computer "
-                    "(STUDY_DECK_BROWSER_MODE_ACKNOWLEDGED). Other players can't connect Brightspace.")
-    if settings.demo_mode:
-        log.warning("Demo mode: sample courses only%s.",
-                    "" if settings.genai_api_key else ", offline question generator")
-    host = "127.0.0.1"
-    uvicorn.run(create_app(settings, open_window=settings.browser_mode), host=host, port=int(__import__("os").environ.get("PORT", "8000")))
+                    "(STUDY_DECK_BROWSER_MODE_ACKNOWLEDGED). Players on other devices sign in here, "
+                    "in private windows.")
+    elif not settings.oauth_client_id:
+        log.info("Brightspace isn't connected on this server: players add their own files and notes.")
+    lines = [f"  On this computer:   {settings.public_url}"]
+    if settings.host not in LOCAL_HOSTS:
+        public = urlsplit(settings.public_url).hostname or ""
+        ip = lan_address()
+        if public not in LOCAL_HOSTS:
+            lines.append(f"  Players join at:    {settings.public_url}")
+        elif ip:
+            lines.append(f"  Same Wi-Fi players: http://{ip}:{settings.port}")
+        else:
+            lines.append("  No network connection found, so only this computer can reach it.")
+    print("\nStudy Deck is running.\n" + "\n".join(lines) + "\n  Press Ctrl+C to stop.\n", flush=True)
+    open_browser = os.environ.get("STUDY_DECK_OPEN_BROWSER", "true").strip().lower() in {"1", "true", "yes", "on"}
+    uvicorn.run(create_app(settings, open_window=open_browser or settings.browser_mode),
+                host=settings.host, port=settings.port, log_level="warning")
 
 
 if __name__ == "__main__":

@@ -46,10 +46,16 @@ def check_genai_url(url: str) -> str:
 class StudyDeckSettings:
     public_url: str = "http://127.0.0.1:8000"
     session_secret: str = field(default_factory=lambda: secrets.token_urlsafe(32))
-    demo_mode: bool = True
+    # Network address the server listens on. 0.0.0.0 lets phones and laptops on the
+    # same Wi-Fi join; 127.0.0.1 keeps it to this computer.
+    host: str = "0.0.0.0"
+    port: int = 8000
     # Personal sign-in: the person running the app on this computer signs in to
     # Brightspace in a browser window and the app uses that session (opt-in).
     browser_mode: bool = False
+    # Read Boilerexams past exam questions as a style guide for the AI (on when the app
+    # is started; off by default here so code that builds settings directly stays offline).
+    boilerexams: bool = False
 
     genai_url: str = DEFAULT_GENAI_URL
     genai_model: str = "llama3.1:latest"
@@ -64,10 +70,15 @@ class StudyDeckSettings:
     max_sessions: int = 200
     max_deck_size: int = 100
     max_upload_bytes: int = 15 * 1024 * 1024
-    max_files_per_player: int = 20
+    max_files_per_player: int = 60
     max_course_files: int = 30
 
     brightspace: Settings = field(default_factory=Settings)
+
+    @property
+    def brightspace_enabled(self) -> bool:
+        """Players can connect Brightspace: a Purdue OAuth client, or personal sign-in."""
+        return bool(self.oauth_client_id) or self.browser_mode
 
     @property
     def secure_cookies(self) -> bool:
@@ -77,7 +88,8 @@ class StudyDeckSettings:
     def from_env(cls) -> "StudyDeckSettings":
         client_id = _env("OAUTH_CLIENT_ID")
         scopes = _env("OAUTH_SCOPES")
-        public_url = (_env("PUBLIC_URL", "http://127.0.0.1:8000") or "").rstrip("/")
+        port = int(os.environ.get("PORT") or _env("PORT", "8000") or 8000)
+        public_url = (_env("PUBLIC_URL", f"http://127.0.0.1:{port}") or "").rstrip("/")
         # Uses your own signed-in session for automated read-only requests, which
         # Purdue has not explicitly authorized, so it must be acknowledged.
         browser_mode = client_id is None and _bool("BROWSER_MODE_ACKNOWLEDGED", False)
@@ -87,10 +99,10 @@ class StudyDeckSettings:
         return cls(
             public_url=public_url,
             session_secret=_env("SESSION_SECRET") or secrets.token_urlsafe(32),
-            # Without a Purdue-issued Brightspace OAuth client (or personal sign-in)
-            # the app runs on sample courses only. It never uses passwords or scraping.
-            demo_mode=_bool("DEMO", client_id is None and not browser_mode),
+            host=_env("HOST", "0.0.0.0") or "0.0.0.0",
+            port=port,
             browser_mode=browser_mode,
+            boilerexams=_bool("BOILEREXAMS", True),
             genai_url=check_genai_url(_env("GENAI_URL", DEFAULT_GENAI_URL) or DEFAULT_GENAI_URL),
             genai_model=_env("GENAI_MODEL", "llama3.1:latest") or "llama3.1:latest",
             genai_api_key=_env("GENAI_API_KEY"),
